@@ -494,11 +494,66 @@ CREATE TABLE IF NOT EXISTS shift_logs (
   action TEXT NOT NULL, -- schedule/autofill/cancel/checkin/late/leave/checkout/absent/swap_request/swap_approve/swap_reject/ot_request/ot_approve/ot_reject
   note TEXT NOT NULL DEFAULT '',
   staff_id INTEGER,
-  approver_id INTEGER
+  approver_id INTEGER,
+  plan_id INTEGER                    -- 跨日计划动作关联（plan_create/plan_approve/plan_reject/plan_item）
 );
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_sched ON shift_logs(schedule_id);
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_att ON shift_logs(attendance_id);
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_req ON shift_logs(request_id);
+
+-- ---------------- 跨日排班计划：需求画像 → 跨日补班/紧急调令草案 → 主管预览审批 → 原子落地 ----------------
+-- 计划头：引擎按「预约客流 / 检修工单 / 投诉优先级」生成跨日（默认未来 3 天）草案，主管预览后批准/驳回。
+-- 审批模式（schedulePlanApproval=1）下动态调度不直接写排班，一律落草案待批；计划批准时在同一事务内
+-- 原子创建全部补班排班与紧急加班调令（调令随批准直接生效写入考勤），任一项冲突只跳过该项、不影响其余，
+-- 提交后再按最新需求补缺，保证排班、工资预测与岗位覆盖口径一致。
+CREATE TABLE IF NOT EXISTS schedule_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',        -- JH0001
+  status TEXT NOT NULL DEFAULT 'pending', -- draft 草案 / pending 待审批 / approved 已批准 / rejected 已驳回 / cancelled 已废弃
+  horizon INTEGER NOT NULL DEFAULT 3,   -- 覆盖游戏日数（含当天）
+  day_from INTEGER NOT NULL,            -- 起始游戏日
+  day_to INTEGER NOT NULL,              -- 结束游戏日
+  reason TEXT NOT NULL DEFAULT '',      -- 生成原因（引擎巡检/客流变化/主管手动）
+  source TEXT NOT NULL DEFAULT 'engine',-- engine 引擎自动 / manual 主管手动生成
+  demand_signature TEXT NOT NULL DEFAULT '', -- 生成时需求指纹（客流/工单/投诉/在册排班），读取时重算比对判定是否过期
+  item_count INTEGER NOT NULL DEFAULT 0,
+  est_wage INTEGER NOT NULL DEFAULT 0,  -- 预计新增工资合计（基准工时 + 1.5 倍加班，批准时按当时时薪重算）
+  applied_count INTEGER NOT NULL DEFAULT 0,  -- 批准成功落地条数
+  skipped_count INTEGER NOT NULL DEFAULT 0,  -- 批准时因冲突/班段已过跳过条数
+  approver_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  handle_tick INTEGER NOT NULL DEFAULT 0,
+  handle_day INTEGER NOT NULL DEFAULT 0,
+  handle_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_splan_status ON schedule_plans(status, day_from);
+
+-- 计划明细：每条对应一个跨日补位动作（add_schedule 新排班 / add_overtime 紧急加班调令）
+CREATE TABLE IF NOT EXISTS schedule_plan_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id INTEGER NOT NULL,
+  day INTEGER NOT NULL,                 -- 目标游戏日
+  band TEXT NOT NULL DEFAULT '',        -- morning/mid/evening/night 班段
+  role TEXT NOT NULL DEFAULT '',        -- 保安/安保 / 保洁 / 维修工
+  action TEXT NOT NULL DEFAULT 'add_schedule', -- add_schedule / add_overtime
+  staff_id INTEGER NOT NULL,
+  shift_id INTEGER NOT NULL,
+  schedule_id INTEGER,                  -- 对应当前在岗排班（add_overtime 调令用）
+  attendance_id INTEGER,                -- 调令对应的在岗考勤（批准时校验仍在岗）
+  ot_ticks INTEGER NOT NULL DEFAULT 0,  -- 加班时长（紧急调令）
+  est_wage INTEGER NOT NULL DEFAULT 0,  -- 预计工资增量
+  demand_reason TEXT NOT NULL DEFAULT '',-- 需求依据（客流峰值/工单号/投诉号与优先级）
+  refs_json TEXT NOT NULL DEFAULT '[]', -- 关联工单/投诉快照 [{kind,id,code,priority}]
+  status TEXT NOT NULL DEFAULT 'pending', -- pending 待批 / applied 已落地 / skipped 已跳过（附 skip_reason）
+  result_schedule_id INTEGER,           -- 批准后创建的排班 id
+  result_request_id INTEGER,            -- 批准后生效的加班调令申请 id
+  skip_reason TEXT NOT NULL DEFAULT '',
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_splan_items_plan ON schedule_plan_items(plan_id);
+CREATE INDEX IF NOT EXISTS idx_splan_items_day ON schedule_plan_items(day, status);
 
 -- ---------------- 领队组团：入园 + 多设施行程团队预约 ----------------
 -- 团单：领队提交（pending）→ 运营确认锁定名额并收订金（confirmed）→ 分批核销/尾款结算 → 完成/爽约结案/取消
@@ -654,6 +709,8 @@ ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'
 ensureColumn('shift_requests', 'source', "source TEXT NOT NULL DEFAULT 'staff'")
 // 领队组团：source='group' 的预约单关联团行程明细 id（款项走团账，该预约 amount 恒为 0）
 ensureColumn('reservations', 'group_item_id', "group_item_id INTEGER")
+// 跨日排班计划：时间线关联计划 id（老库无列时补齐）
+ensureColumn('shift_logs', 'plan_id', "plan_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -822,6 +879,7 @@ function seed() {
   shifts.forEach(s => ish.run(...s))
   setIf('scheduleAutoFill', 1)            // 自动补位开关（引擎按需求为未来三天补齐缺口）
   setIf('scheduleMode', 'dynamic')        // dynamic 动态调度（按客流/工单/投诉）；auto 全员基础补位
+  setIf('schedulePlanApproval', 0)        // 跨日计划审批：1=动态补位先出跨日计划草案待主管审批，0=直接落排班
   setIf('otRateMul', 1.5)                 // 加班时薪倍率
   setIf('dispatchGuardFlow', 500)         // 每名保安班段可承载的预约预测客流
   setIf('dispatchCleanFlow', 700)         // 每名保洁班段可承载的预约预测客流
@@ -889,6 +947,7 @@ function ensureScheduleBaseData() {
   for (const [k, v] of [
     ['scheduleAutoFill', 1],       // 自动补位总开关
     ['scheduleMode', 'dynamic'],   // auto=全员基础补位；dynamic=按客流/工单/投诉需求动态调度
+    ['schedulePlanApproval', 0],   // 1=跨日动态补位先出计划草案待主管审批；0=直接落排班
     ['otRateMul', 1.5],
     // 动态调度参数：每个保安/保洁可承载的预约预测客流（人/班段）；夜班每个开放区域保安数
     ['dispatchGuardFlow', 500],

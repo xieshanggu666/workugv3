@@ -28,7 +28,9 @@ import {
   requestOvertime, approveOvertime, rejectOvertime, cancelRequest,
   listSchedules, listAttendance, listRequests as listShiftRequests,
   shiftLogs, schedulingStats, coverageForDay, staffDutyState, writeWorkCompletion,
-  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter
+  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter,
+  generateSchedulePlan, approveSchedulePlan, rejectSchedulePlan, cancelSchedulePlan,
+  listSchedulePlans, schedulePlanDetail, currentPendingPlan
 } from './scheduling.js'
 import {
   initGroupContext, submitGroup, confirmGroup, rejectGroup, cancelGroup,
@@ -931,6 +933,7 @@ app.get('/api/state', (req, res) => {
     schedulingStats: schedulingStats(),
     coverageToday: coverageForDay(state.day()),
     dispatchPlan: dispatchPlan({ horizon: 3 }),
+    pendingSchedulePlan: currentPendingPlan(),
     // 统一客流预测与资源调度闭环（统一预测 + 缺口画像 + 一致性巡检）
     closedLoop: closedLoopOverview({ horizon: 3, demandProvider: d => demandForDay(d) }),
     reconcileList: listFindings({ status: 'open', limit: 50 }),
@@ -1372,7 +1375,8 @@ app.get('/api/schedules/logs', (req, res) => {
   res.json({ logs: shiftLogs({
     scheduleId: q.scheduleId ? num(q.scheduleId) : null,
     attendanceId: q.attendanceId ? num(q.attendanceId) : null,
-    requestId: q.requestId ? num(q.requestId) : null
+    requestId: q.requestId ? num(q.requestId) : null,
+    planId: q.planId ? num(q.planId) : null
   }) })
 })
 
@@ -1460,6 +1464,7 @@ app.post('/api/schedule-config', (req, res) => {
   const b = req.body || {}
   if (b.auto_fill !== undefined) setSetting('scheduleAutoFill', b.auto_fill ? 1 : 0)
   if (b.mode !== undefined) setSetting('scheduleMode', b.mode === 'auto' ? 'auto' : 'dynamic')
+  if (b.plan_approval !== undefined) setSetting('schedulePlanApproval', b.plan_approval ? 1 : 0)
   if (b.ot_rate_mul !== undefined) {
     const v = Math.max(1, Math.min(3, num(b.ot_rate_mul, 1.5)))
     setSetting('otRateMul', v)
@@ -1470,6 +1475,7 @@ app.post('/api/schedule-config', (req, res) => {
   res.json({ ok: true, config: {
     autoFill: num(getSetting('scheduleAutoFill'), 1) ? 1 : 0,
     mode: getSetting('scheduleMode', 'dynamic'),
+    planApproval: num(getSetting('schedulePlanApproval'), 0) ? 1 : 0,
     otRateMul: num(getSetting('otRateMul'), 1.5),
     guardFlow: num(getSetting('dispatchGuardFlow'), 500),
     cleanFlow: num(getSetting('dispatchCleanFlow'), 700),
@@ -1482,15 +1488,81 @@ app.get('/api/dispatch-plan', (req, res) => {
   res.json({ plan: dispatchPlan({ horizon: 3 }) })
 })
 
-// 手动触发一次动态补位：按需求缺口自动排班；当天已开始班段的缺口转紧急加班调令（走主管审批）
+// 手动触发一次动态补位：按需求缺口自动排班；当天已开始班段的缺口转紧急加班调令（走主管审批）。
+// 跨日计划审批模式开启时，不直接落排班，改为生成/刷新一份待主管审批的跨日计划草案。
 app.post('/api/dispatch/run', (req, res) => {
   const b = req.body || {}
+  if (num(getSetting('schedulePlanApproval'), 0)) {
+    const r = generateSchedulePlan({
+      horizon: 3,
+      reason: String(b.reason || '主管手动生成跨日计划'),
+      source: 'manual',
+      requestId: idemKey(req),
+      replace: true
+    })
+    return res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId, plan: r.ok ? schedulePlanDetail(r.id) : currentPendingPlan() })
+  }
   const r = runDynamicDispatch({
     horizon: 3,
     urgentOvertime: b.urgent_overtime !== false,
     reason: String(b.reason || '主管手动触发动态调度')
   })
   res.json({ ...r, reqId: req.reqId, plan: dispatchPlan({ horizon: 3 }) })
+})
+
+// ---- 跨日排班计划：预览 / 审批 ----
+// 待审批计划（唯一）+ 近期历史
+app.get('/api/schedule-plans', (req, res) => {
+  const q = req.query || {}
+  if (q.status === 'pending') {
+    const pending = currentPendingPlan()
+    return res.json({ pending, list: pending ? [pending] : [] })
+  }
+  res.json({ list: listSchedulePlans({ status: q.status && q.status !== 'all' ? q.status : 'all', limit: 30 }) })
+})
+
+app.get('/api/schedule-plans/:id', (req, res) => {
+  const plan = schedulePlanDetail(num(req.params.id))
+  if (!plan) return res.status(404).json({ ok: false, msg: '跨日计划不存在' })
+  res.json({ plan })
+})
+
+// 生成 / 刷新跨日计划草案（幂等）
+app.post('/api/schedule-plans/generate', (req, res) => {
+  const b = req.body || {}
+  const r = generateSchedulePlan({
+    horizon: num(b.horizon, 3),
+    reason: String(b.reason || '主管手动生成跨日计划'),
+    source: 'manual',
+    requestId: idemKey(req),
+    replace: b.replace !== false
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId, plan: r.ok ? schedulePlanDetail(r.id) : null })
+})
+
+// 主管批准：原子落地全部补班与紧急调令（单项冲突跳过并留痕），提交后按最新需求补缺
+app.post('/api/schedule-plans/:id/approve', (req, res) => {
+  const b = req.body || {}
+  const r = approveSchedulePlan(num(req.params.id), {
+    approverId: num(b.approver_id) || null,
+    note: String(b.note || ''),
+    requestId: idemKey(req)
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId, plan: schedulePlanDetail(num(req.params.id)) })
+})
+
+app.post('/api/schedule-plans/:id/reject', (req, res) => {
+  const b = req.body || {}
+  const r = rejectSchedulePlan(num(req.params.id), {
+    approverId: num(b.approver_id) || null,
+    note: String(b.note || '')
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+app.post('/api/schedule-plans/:id/cancel', (req, res) => {
+  const r = cancelSchedulePlan(num(req.params.id), { note: String(req.body?.note || '') })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
 })
 
 // 单日需求画像（覆盖预警页按日查看）

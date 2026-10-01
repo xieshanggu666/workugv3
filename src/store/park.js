@@ -43,7 +43,9 @@ function emptySchedulingStats() {
     day: 1, todayScheduled: 0, onDuty: 0, absentToday: 0, lateToday: 0,
     overtimeHoursToday: 0, settledToday: 0, payToday: 0, pendingRequests: 0,
     coverageWarnings: 0, coverageBlocks: 0,
-    dispatchOtRequests: 0, dispatchFilledToday: 0, nightOnDuty: 0, flowToday: 0
+    dispatchOtRequests: 0, dispatchFilledToday: 0, nightOnDuty: 0, flowToday: 0,
+    planApprovalMode: 0, pendingPlan: 0, pendingPlanId: null, pendingPlanStale: 0,
+    pendingPlanItems: 0, pendingPlanSchedules: 0, pendingPlanOvertimes: 0, pendingPlanWage: 0
   }
 }
 
@@ -99,6 +101,7 @@ export const useParkStore = defineStore('park', {
     schedulingStats: s => s.data?.schedulingStats || emptySchedulingStats(),
     coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0 },
     dispatchPlanData: s => s.data?.dispatchPlan || { days: [], params: {}, mode: 'dynamic' },
+    pendingSchedulePlan: s => s.data?.pendingSchedulePlan || null,
     supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管'),
     // 领队组团
     groups: s => s.data?.groups || [],
@@ -180,6 +183,13 @@ export const useParkStore = defineStore('park', {
     runDispatch(payload) { return this.api('POST', '/dispatch/run', payload || {}) },
     async coverageOf(day) { return j('GET', `/coverage/${day}`) },
     async dispatchPlanFetch() { return j('GET', '/dispatch-plan') },
+    // 跨日排班计划：生成草案 / 批准 / 驳回 / 废弃 / 查询（写操作携带 request_id 幂等键）
+    generateSchedulePlan(payload) { return this.api('POST', '/schedule-plans/generate', payload) },
+    approveSchedulePlan(id, payload) { return this.api('POST', `/schedule-plans/${id}/approve`, payload) },
+    rejectSchedulePlan(id, payload) { return this.api('POST', `/schedule-plans/${id}/reject`, payload) },
+    cancelSchedulePlan(id, payload) { return this.api('POST', `/schedule-plans/${id}/cancel`, payload || {}) },
+    async schedulePlans(status = 'all') { return j('GET', `/schedule-plans?status=${status}`) },
+    async schedulePlanDetail(id) { return j('GET', `/schedule-plans/${id}`) },
     async scheduleLogs(payload) {
       const q = new URLSearchParams(Object.entries(payload).filter(([, v]) => v != null && v !== '').map(([k, v]) => [k, v])).toString()
       return j('GET', `/schedules/logs?${q}`)

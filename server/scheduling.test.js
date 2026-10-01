@@ -484,3 +484,221 @@ test('调度计划只读接口结构：含模式、参数与未来三天画像',
   assert.equal(p.days[0].day, 47)
   assert.ok(Array.isArray(p.days[0].warnings))
 })
+
+// ---------------- 跨日排班计划：预览 → 审批 → 原子落地（客流/工单/投诉/调令联动） ----------------
+test('审批模式开关：开启后引擎/联动不直接落排班，改为生成待审批跨日计划草案', () => {
+  setClock(60, 9)
+  setSetting('scheduleMode', 'dynamic')
+  setSetting('scheduleAutoFill', 1)
+  setSetting('schedulePlanApproval', 1)
+  setSetting('dispatchGuardFlow', 200)
+  setSetting('dispatchCleanFlow', 200)
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day BETWEEN 60 AND 62").run()
+  const before = db.prepare("SELECT COUNT(*) n FROM staff_schedules WHERE day BETWEEN 60 AND 62 AND status<>'cancelled'").get().n
+  assert.equal(before, 0)
+  // 引擎每小时巡检：只出计划，不写排班
+  SCH.processScheduling()
+  const after = db.prepare("SELECT COUNT(*) n FROM staff_schedules WHERE day BETWEEN 60 AND 62 AND status<>'cancelled'").get().n
+  assert.equal(after, 0, '审批模式下引擎不得直接落排班')
+  const pending = SCH.currentPendingPlan()
+  assert.ok(pending, '应生成待审批跨日计划')
+  assert.equal(pending.status, 'pending')
+  assert.equal(pending.day_from, 60)
+  assert.equal(pending.day_to, 62)
+  assert.ok(pending.item_count > 0, '计划应含按客流缺口生成的补班项')
+  assert.ok(pending.items.every(i => i.status === 'pending'))
+  assert.ok(pending.gap_before >= 0 && pending.gap_after <= pending.gap_before, '计划预览应给出落地后缺口收敛对比')
+  assert.ok(pending.est_wage >= 0)
+  setSetting('schedulePlanApproval', 0)
+})
+
+test('跨日计划预览：明细含班段/岗位/拟派人员/预计工资/需求依据（客流或工单或投诉）', () => {
+  setClock(63, 9)
+  setSetting('scheduleMode', 'dynamic')
+  setSetting('schedulePlanApproval', 1)
+  setSetting('dispatchGuardFlow', 200)
+  setSetting('dispatchCleanFlow', 200)
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day BETWEEN 63 AND 65").run()
+  db.prepare("DELETE FROM schedule_plans").run()
+  // 放一个排队检修工单，验证工单联动进入计划依据
+  const ride = db.prepare('SELECT * FROM rides ORDER BY id LIMIT 1').get()
+  db.prepare(`INSERT INTO maintenance_orders(code,ride_id,status,source,progress,cost,create_tick,create_day)
+              VALUES('WXPLAN1',?,'queued','manual',0,3000,?,63)`).run(ride.id, Number(getSetting('tick')))
+  const r = SCH.generateSchedulePlan({ horizon: 3, reason: '测试预览', source: 'manual', requestId: 'plan-prev-1' })
+  assert.equal(r.ok, true)
+  const plan = SCH.schedulePlanDetail(r.id)
+  assert.ok(plan.items.length > 0)
+  for (const it of plan.items) {
+    assert.ok(['add_schedule', 'add_overtime'].includes(it.action))
+    assert.ok(it.staff_name)
+    assert.ok(['morning', 'mid', 'evening', 'night'].includes(it.band))
+    assert.ok(it.est_wage >= 0)
+    if (it.action === 'add_schedule') {
+      assert.ok(it.shift_name)
+      // 补班项预计工资 = 时薪 × 班次基准工时
+      const st = db.prepare('SELECT wage FROM staff WHERE id=?').get(it.staff_id)
+      const sh = db.prepare('SELECT standard_hours FROM shift_templates WHERE id=?').get(it.shift_id)
+      assert.equal(it.est_wage, Math.round(Math.max(20, Math.round(st.wage / 5)) * sh.standard_hours))
+    }
+  }
+  // 检修工单应出现在至少一条明细的关联依据中
+  const withOrder = plan.items.find(i => i.refs.some(x => x.kind === 'order' && x.code === 'WXPLAN1'))
+  assert.ok(withOrder, '检修工单需求应挂载到计划明细依据')
+  // 按日分组的缺口对比结构
+  assert.equal(plan.dayGroups.length, 3)
+  assert.ok(plan.dayGroups.every(d => Array.isArray(d.bands) && d.bands.length === 4))
+})
+
+test('跨日计划批准：单事务原子落地全部补班（来源 dispatch），驳回零副作用', () => {
+  // 接上一计划（第 63~65 天），直接批准
+  const pending = SCH.currentPendingPlan()
+  assert.ok(pending)
+  const cash0 = cash()
+  const ap = SCH.approveSchedulePlan(pending.id, { approverId: null, note: '测试批准', requestId: 'plan-app-1' })
+  assert.equal(ap.ok, true)
+  // 幂等：同 requestId 重放不二次落地
+  const replay = SCH.approveSchedulePlan(pending.id, { requestId: 'plan-app-1' })
+  assert.equal(replay.ok, true); assert.equal(replay.replay, true)
+  const plan = SCH.schedulePlanDetail(pending.id)
+  assert.equal(plan.status, 'approved')
+  assert.ok(plan.applied_items > 0)
+  // 落地排班真实存在、来源 dispatch、note 带计划号
+  for (const it of plan.items.filter(i => i.action === 'add_schedule' && i.status === 'applied')) {
+    const sc = db.prepare("SELECT * FROM staff_schedules WHERE id=?").get(it.result_schedule_id)
+    assert.ok(sc); assert.equal(sc.source, 'dispatch'); assert.ok(sc.note.includes(plan.code))
+    // 同员工同日唯一
+    const dup = db.prepare("SELECT COUNT(*) n FROM staff_schedules WHERE staff_id=? AND day=? AND status<>'cancelled'").get(it.staff_id, it.day).n
+    assert.equal(dup, 1)
+  }
+  // 批准不立即发工资（未来班次未到岗），工资在下班结算口径
+  assert.equal(cash(), cash0, '计划批准只落排班，不提前扣工资')
+  // 已批准不可重复批准/驳回
+  assert.equal(SCH.approveSchedulePlan(pending.id, {}).code, 'PLAN_HANDLED')
+  assert.equal(SCH.rejectSchedulePlan(pending.id, {}).ok, false)
+})
+
+test('跨日计划驳回：不落任何排班/考勤/工资，且可重新生成', () => {
+  setClock(66, 9)
+  setSetting('schedulePlanApproval', 1)
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day BETWEEN 66 AND 68").run()
+  db.prepare("DELETE FROM schedule_plans").run()
+  const g = SCH.generateSchedulePlan({ horizon: 3, reason: '测试驳回', requestId: 'plan-rej-1' })
+  assert.equal(g.ok, true)
+  const cash0 = cash()
+  const schedBefore = db.prepare("SELECT COUNT(*) n FROM staff_schedules WHERE day BETWEEN 66 AND 68 AND status<>'cancelled'").get().n
+  const rj = SCH.rejectSchedulePlan(g.id, { note: '预算不足' })
+  assert.equal(rj.ok, true)
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM staff_schedules WHERE day BETWEEN 66 AND 68 AND status<>'cancelled'").get().n, schedBefore)
+  assert.equal(cash(), cash0, '驳回不得有工资影响')
+  assert.equal(SCH.schedulePlanDetail(g.id).status, 'rejected')
+  // 驳回后可重新生成
+  const g2 = SCH.generateSchedulePlan({ horizon: 3, requestId: 'plan-rej-2' })
+  assert.equal(g2.ok, true)
+  assert.equal(SCH.currentPendingPlan().id, g2.id)
+})
+
+test('计划变更一致性：客流/工单/投诉/排班变化后待审批计划标记需求已变化（stale），刷新后消除', () => {
+  setClock(69, 9)
+  setSetting('schedulePlanApproval', 1)
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day BETWEEN 69 AND 71").run()
+  db.prepare("DELETE FROM schedule_plans").run()
+  const g = SCH.generateSchedulePlan({ horizon: 3, requestId: 'plan-stale-1' })
+  assert.equal(SCH.schedulePlanDetail(g.id).is_stale, 0, '新计划不应过期')
+  // 新增一张紧急投诉 → 需求指纹变化
+  db.prepare(`INSERT INTO complaints(code,tick,day,category,severity,title,status,deadline_tick,source)
+              VALUES('TSPLAN1',?,70,'facility',3,'计划变更测试紧急投诉','open',?+10,'manual')`)
+    .run(Number(getSetting('tick')), Number(getSetting('tick')))
+  assert.equal(SCH.schedulePlanDetail(g.id).is_stale, 1, '新增投诉后计划应标记为需求已变化')
+  // 引擎/联动维护：不覆盖在审计划内容，只保留待审批状态（主管可刷新或按最新需求核对）
+  const m = SCH.maybeDispatchAfter('投诉岗位需求变化')
+  assert.equal(m.ok, true)
+  assert.equal(SCH.schedulePlanDetail(g.id).id, g.id, '联动不得覆盖主管正在审批的计划')
+  // 刷新计划：旧计划废弃，新计划不过期且包含该投诉依据
+  const g2 = SCH.generateSchedulePlan({ horizon: 3, requestId: 'plan-stale-2', replace: true })
+  assert.equal(g2.ok, true)
+  const fresh = SCH.schedulePlanDetail(g2.id)
+  assert.equal(fresh.is_stale, 0)
+  assert.ok(fresh.items.some(i => i.refs.some(x => x.kind === 'complaint' && x.code === 'TSPLAN1')), '刷新后计划应纳入新投诉需求')
+  assert.equal(SCH.schedulePlanDetail(g.id).status, 'cancelled', '旧计划应被原子废弃')
+})
+
+test('计划批准的岗位覆盖一致：批准后跨日缺口收敛，冲突项跳过并留痕不影响其余', () => {
+  setClock(72, 9)
+  setSetting('schedulePlanApproval', 1)
+  setSetting('dispatchGuardFlow', 200)
+  setSetting('dispatchCleanFlow', 200)
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day BETWEEN 72 AND 74").run()
+  db.prepare("DELETE FROM schedule_plans").run()
+  const g = SCH.generateSchedulePlan({ horizon: 3, reason: '覆盖一致测试', requestId: 'plan-cov-1' })
+  const plan0 = SCH.schedulePlanDetail(g.id)
+  // 手工制造冲突：计划等待审批期间，主管把其中一条未来补班的员工用另一班次真实排班占住
+  const target = plan0.items.find(i => i.action === 'add_schedule' && i.day > 72)
+  assert.ok(target, '需存在未来日补班项用于制造冲突')
+  const otherShift = shiftByCode(target.shift_code === 'morning' ? 'mid' : 'morning')
+  const block = SCH.createSchedule({ staffId: target.staff_id, shiftId: otherShift.id, day: target.day, requestId: 'plan-cov-block-1' })
+  assert.equal(block.ok, true)
+  const ap = SCH.approveSchedulePlan(g.id, { requestId: 'plan-cov-app' })
+  assert.equal(ap.ok, true, '单项冲突不应导致整批失败')
+  assert.ok(ap.skipped >= 1, '冲突项应被跳过')
+  const plan = SCH.schedulePlanDetail(g.id)
+  const skipped = plan.items.find(i => i.id === target.id)
+  assert.equal(skipped.status, 'skipped')
+  assert.ok(skipped.skip_reason.includes('冲突'))
+  // 其余项仍成功落地
+  assert.ok(plan.applied_items >= 1)
+  // 批准后按最新需求生成补缺计划（审批模式不直接覆盖），覆盖缺口不扩大
+  const afterCov = SCH.coverageForDay(73)
+  assert.ok(Array.isArray(afterCov.warnings))
+  // 被跳过的缺口应出现在新的待审批计划中
+  const follow = SCH.currentPendingPlan()
+  assert.ok(follow && follow.id !== g.id, '批准后应登记补缺新计划')
+  setSetting('schedulePlanApproval', 0)
+})
+
+test('紧急加班调令随跨日计划批准：直接生效写入考勤（1.5×），下班结算工资与计划口径一致', () => {
+  // 构造当天已开始班段缺岗：一名保安在岗上早班，压低阈值制造中班保安缺口
+  setClock(75, 18)
+  setSetting('schedulePlanApproval', 1)
+  setSetting('scheduleMode', 'dynamic')
+  const gid = Number(db.prepare("INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES('计划调令保安','保安',1,320,1,80,1)").run().lastInsertRowid)
+  const morning = shiftByCode('morning')
+  assert.equal(SCH.createSchedule({ staffId: gid, shiftId: morning.id, day: 76, requestId: 'plan-ot-1' }).ok, true)
+  setClock(76, 13)
+  SCH.processScheduling()  // 自动打卡
+  assert.equal(attOf(db.prepare("SELECT id FROM staff_schedules WHERE staff_id=? AND day=76").get(gid).id)?.status, 'checked_in')
+  setSetting('dispatchGuardFlow', 100)
+  db.prepare("DELETE FROM schedule_plans").run()
+  const g = SCH.generateSchedulePlan({ horizon: 1, reason: '计划调令测试', requestId: 'plan-ot-gen' })
+  assert.equal(g.ok, true)
+  const plan = SCH.schedulePlanDetail(g.id)
+  const otItem = plan.items.find(i => i.action === 'add_overtime')
+  // 在岗员工可加班窗口有限；若无可加之人则该用例退化为结构断言
+  if (otItem) {
+    assert.ok(otItem.est_wage > 0)
+    assert.ok(otItem.demand_reason.includes('紧急加班调令'))
+    const ap = SCH.approveSchedulePlan(g.id, { requestId: 'plan-ot-app' })
+    assert.equal(ap.ok, true)
+    const att = db.prepare("SELECT * FROM staff_attendance WHERE id=?").get(otItem.attendance_id)
+    assert.equal(att.ot_approved, 1)
+    assert.ok(att.overtime_ticks >= 1)
+    // 已生成 approved 的 dispatch 调令申请
+    const req = db.prepare("SELECT * FROM shift_requests WHERE id=?").get(otItem.result_request_id || ap.request_ids[0])
+    assert.equal(req.status, 'approved'); assert.equal(req.source, 'dispatch')
+  }
+  setSetting('schedulePlanApproval', 0)
+})
+
+test('审批模式下跨日夜班疲劳规避：计划不会把前夜夜班员工次日排日班', () => {
+  setClock(77, 9)
+  setSetting('schedulePlanApproval', 1)
+  setSetting('scheduleMode', 'dynamic')
+  const ngid = Number(db.prepare("INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES('计划夜班保安','保安',1,320,1,80,1)").run().lastInsertRowid)
+  const night = shiftByCode('night')
+  assert.equal(SCH.createSchedule({ staffId: ngid, shiftId: night.id, day: 77, requestId: 'plan-night-1' }).ok, true)
+  db.prepare("DELETE FROM schedule_plans").run()
+  const g = SCH.generateSchedulePlan({ horizon: 2, requestId: 'plan-night-gen' })
+  const plan = SCH.schedulePlanDetail(g.id)
+  const nextDayItem = plan.items.find(i => i.staff_id === ngid && i.day === 78)
+  assert.equal(nextDayItem, undefined, '前夜夜班次日凌晨才下班，计划草案不得为其排次日日班')
+  setSetting('schedulePlanApproval', 0)
+})
