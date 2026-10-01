@@ -633,7 +633,64 @@ CREATE TABLE IF NOT EXISTS reconcile_findings (
   heal_tick INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_reconcile_status ON reconcile_findings(status,kind);
-CREATE INDEX IF NOT EXISTS idx_reconcile_ref ON reconcile_findings(ref_type,ref_id)
+CREATE INDEX IF NOT EXISTS idx_reconcile_ref ON reconcile_findings(ref_type,ref_id);
+
+-- ---------------- 动态排班跨日计划预览与审批 ----------------
+-- 跨日调度计划：动态调度引擎对未来 horizon 天做「干跑（dry-run）」推演的结果，
+-- 主管审批前不产生真实排班/调令；审批通过时在同一事务内二次校验并原子落地。
+-- source=manual 主管手动生成预览 / auto 引擎每小时联动（预约客流/检修工单/投诉优先级）自动生成待批计划。
+CREATE TABLE IF NOT EXISTS dispatch_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',          -- JH0001
+  status TEXT NOT NULL DEFAULT 'pending', -- pending 待审批 / approved 已批准 / rejected 已驳回 / obsolete 被新计划取代 / expired 已过期
+  source TEXT NOT NULL DEFAULT 'manual',  -- manual / auto
+  horizon INTEGER NOT NULL DEFAULT 3,
+  day_from INTEGER NOT NULL,
+  day_to INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  demand_snapshot TEXT NOT NULL DEFAULT '', -- 生成时需求快照（JSON）：每日预约客流/检修工单/投诉/班段需求
+  demand_signature TEXT NOT NULL DEFAULT '',-- 需求指纹：读取时重算对比，变化即标记计划已过时
+  est_wage INTEGER NOT NULL DEFAULT 0,    -- 预估工资合计（基准工时工资 + 加班溢价，元）
+  est_ot_wage INTEGER NOT NULL DEFAULT 0, -- 预估加班工资金额（元）
+  item_count INTEGER NOT NULL DEFAULT 0,
+  schedule_count INTEGER NOT NULL DEFAULT 0,
+  ot_count INTEGER NOT NULL DEFAULT 0,
+  applied_schedules INTEGER NOT NULL DEFAULT 0, -- 审批实际落地排班数（二次校验失效的条目跳过）
+  applied_ots INTEGER NOT NULL DEFAULT 0,       -- 审批实际生成紧急调令数
+  skipped_items INTEGER NOT NULL DEFAULT 0,
+  approver_id INTEGER,
+  approve_note TEXT NOT NULL DEFAULT '',
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  handle_tick INTEGER NOT NULL DEFAULT 0,
+  handle_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_dplan_status ON dispatch_plans(status,source);
+CREATE INDEX IF NOT EXISTS idx_dplan_days ON dispatch_plans(day_from,day_to);
+
+-- 计划条目：每条 = 一个拟新增排班（schedule）或一条拟生成的系统紧急加班调令（overtime）
+-- reason_snapshot 记录该条目联动的缺口依据（班段客流峰值/检修工单/投诉优先级分值），审批页可追溯。
+CREATE TABLE IF NOT EXISTS dispatch_plan_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,         -- 推演顺序（按日×班段×优先级）
+  kind TEXT NOT NULL,                     -- schedule 新增排班 / overtime 紧急加班调令
+  day INTEGER NOT NULL,                   -- 排班所属游戏日（跨日夜班归上班日）
+  band TEXT NOT NULL DEFAULT '',          -- morning/mid/evening/night
+  role TEXT NOT NULL DEFAULT '',          -- 保安/安保 / 保洁 / 维修工
+  staff_id INTEGER NOT NULL,
+  shift_id INTEGER,                       -- schedule：目标班次；overtime：当值班次
+  schedule_id INTEGER,                    -- overtime：当值排班单；审批后 schedule 条目回写新建排班 id
+  ot_ticks INTEGER NOT NULL DEFAULT 0,    -- overtime：加班小时数
+  status TEXT NOT NULL DEFAULT 'pending', -- pending 待批 / applied 已落地 / skipped 已跳过（审批时已失效/冗余）
+  est_wage INTEGER NOT NULL DEFAULT 0,    -- 该条目预估工资（schedule=基准工时工资；overtime=1.5 倍加班溢价）
+  allow_started INTEGER NOT NULL DEFAULT 0, -- 生成时该班次是否已开始（审批允许补入刚开始的班段）
+  reason_snapshot TEXT NOT NULL DEFAULT '', -- 缺口依据 JSON（客流峰值/工单号/投诉号与统一优先级分值）
+  note TEXT NOT NULL DEFAULT '',
+  ref_request_id INTEGER                  -- overtime 审批落地后回写 shift_requests.id
+);
+CREATE INDEX IF NOT EXISTS idx_dpitem_plan ON dispatch_plan_items(plan_id,seq);
+CREATE INDEX IF NOT EXISTS idx_dpitem_status ON dispatch_plan_items(status,kind);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -822,6 +879,7 @@ function seed() {
   shifts.forEach(s => ish.run(...s))
   setIf('scheduleAutoFill', 1)            // 自动补位开关（引擎按需求为未来三天补齐缺口）
   setIf('scheduleMode', 'dynamic')        // dynamic 动态调度（按客流/工单/投诉）；auto 全员基础补位
+  setIf('scheduleApproval', 0)            // 动态调度审批模式：1=跨日计划先预览待主管审批，0=引擎直接补位
   setIf('otRateMul', 1.5)                 // 加班时薪倍率
   setIf('dispatchGuardFlow', 500)         // 每名保安班段可承载的预约预测客流
   setIf('dispatchCleanFlow', 700)         // 每名保洁班段可承载的预约预测客流
@@ -889,6 +947,7 @@ function ensureScheduleBaseData() {
   for (const [k, v] of [
     ['scheduleAutoFill', 1],       // 自动补位总开关
     ['scheduleMode', 'dynamic'],   // auto=全员基础补位；dynamic=按客流/工单/投诉需求动态调度
+    ['scheduleApproval', 0],       // 1=跨日动态调度计划需主管预览审批；0=引擎直接自动补位
     ['otRateMul', 1.5],
     // 动态调度参数：每个保安/保洁可承载的预约预测客流（人/班段）；夜班每个开放区域保安数
     ['dispatchGuardFlow', 500],

@@ -6,6 +6,7 @@ const store = useParkStore()
 
 const tabs = [
   { k: 'dispatch', label: '动态调度' },
+  { k: 'plans', label: '跨日计划' },
   { k: 'board', label: '排班看板' },
   { k: 'attendance', label: '考勤工时' },
   { k: 'requests', label: '调班加班' },
@@ -150,12 +151,14 @@ const dispatchMsg = ref('')
 const dispatching = ref(false)
 const configForm = reactive({ mode: 'dynamic', guardFlow: 500, cleanFlow: 700, nightPerZone: 0 })
 const autoFill = ref(true)
+const approvalMode = ref(false)
 function syncConfigForm() {
   configForm.mode = plan.value.mode || 'dynamic'
   configForm.guardFlow = plan.value.params?.guardFlow ?? 500
   configForm.cleanFlow = plan.value.params?.cleanFlow ?? 700
   configForm.nightPerZone = plan.value.params?.nightGuardsPerZone ?? 0
   autoFill.value = plan.value.autoFill !== 0
+  approvalMode.value = plan.value.approvalMode === 1
 }
 // 配置数据到位后同步一次
 if (plan.value.days?.length) syncConfigForm()
@@ -176,16 +179,28 @@ async function toggleAutoFill(v) {
   autoFill.value = v
   await store.saveScheduleConfig({ auto_fill: v ? 1 : 0 })
 }
+async function toggleApprovalMode(v) {
+  approvalMode.value = v
+  await store.saveScheduleConfig({ approval_mode: v ? 1 : 0 })
+  dispatchMsg.value = v ? '已切换为「跨日计划预览审批」：引擎不再直接补位，改为生成待批计划' : '已切换为「引擎直接自动补位」'
+  setTimeout(() => { dispatchMsg.value = '' }, 3500)
+}
 async function runDispatch() {
   if (dispatching.value) return
   dispatching.value = true
-  dispatchMsg.value = '动态调度执行中…'
-  const r = await store.runDispatch({ reason: '主管手动触发动态调度', request_id: newRequestId() })
+  dispatchMsg.value = approvalMode.value ? '正在生成跨日计划预览…' : '动态调度执行中…'
+  const r = await store.runDispatch({ reason: approvalMode.value ? '主管生成跨日调度计划' : '主管手动触发动态调度', request_id: newRequestId() })
   dispatching.value = false
   if (r?.ok) {
-    dispatchMsg.value = `补位完成：新增排班 ${r.created?.length || 0} 张，紧急加班调令 ${r.otRequests?.length || 0} 张（待主管审批）`
+    if (approvalMode.value && r.id) {
+      dispatchMsg.value = `已生成跨日计划 ${r.code || ''}：排班 ${r.scheduleCount} 条、紧急调令 ${r.otCount} 条，预估工资 ¥${r.estWage || 0}`
+      await openPlanDetail(r.id)
+      planListTab.value = 'all'
+    } else {
+      dispatchMsg.value = `补位完成：新增排班 ${r.created?.length || 0} 张，紧急加班调令 ${r.otRequests?.length || 0} 张（待主管审批）`
+    }
   } else dispatchMsg.value = r?.msg || '调度失败'
-  setTimeout(() => { dispatchMsg.value = '' }, 4000)
+  setTimeout(() => { dispatchMsg.value = '' }, 5000)
 }
 const BAND_META = {
   morning: { name: '早班', icon: '🌅', range: '09:00~12:00' },
@@ -251,10 +266,76 @@ const ACTION_LABEL = {
   checkin: '打卡上班', late: '迟到', leave: '离岗', checkout: '下班结算', absent: '旷工',
   workdone: '完工回写',
   swap_request: '申请调班', swap_approve: '批准调班', swap_reject: '驳回调班',
-  ot_request: '申请加班', ot_approve: '批准加班', ot_reject: '驳回加班'
+  ot_request: '申请加班', ot_approve: '批准加班', ot_reject: '驳回加班',
+  plan_approve: '批准跨日计划', plan_reject: '驳回跨日计划'
 }
 
 const stats = computed(() => store.schedulingStats)
+
+// ---- 跨日计划预览与审批 ----
+const planListTab = ref('pending')
+const planList = ref([])
+const planDetail = ref(null)
+const planLoading = ref(false)
+const planListLoading = ref(false)
+const PLAN_STATUS_META = {
+  pending: { label: '待审批', cls: 'st-pending' },
+  approved: { label: '已批准', cls: 'st-approved' },
+  rejected: { label: '已驳回', cls: 'st-rejected' },
+  obsolete: { label: '已被取代', cls: 'st-obsolete' },
+  expired: { label: '已过期', cls: 'st-obsolete' }
+}
+const ITEM_STATE_META = {
+  applicable: { label: '可落地', cls: 'it-ok' },
+  invalid: { label: '已失效', cls: 'it-bad' },
+  redundant: { label: '缺口已消', cls: 'it-skip' },
+  applied: { label: '已落地', cls: 'it-ok' },
+  skipped: { label: '已跳过', cls: 'it-skip' }
+}
+async function loadPlanList(t = planListTab.value) {
+  planListTab.value = t
+  planListLoading.value = true
+  const r = await store.dispatchPlansList(t)
+  planListLoading.value = false
+  if (r?.list) planList.value = r.list
+}
+async function openPlanDetail(id) {
+  planLoading.value = true
+  const r = await store.dispatchPlanDetail(id)
+  planLoading.value = false
+  if (r?.plan) planDetail.value = r.plan
+  else alert(r?.msg || '计划加载失败')
+}
+function closePlanDetail() { planDetail.value = null }
+async function approvePlan(p) {
+  const valid = p.items.filter(i => i.check?.state === 'applicable').length
+  const invalid = p.invalidCount || 0
+  const redundant = p.redundantCount || 0
+  const msg = `确认批准跨日计划 ${p.code}？\n将原子落地 ${valid} 条排班/调令（预估工资 ¥${p.est_wage}）` +
+    `${invalid ? `\n其中 ${invalid} 条已失效将安全跳过` : ''}${redundant ? `\n${redundant} 条缺口已消除不再执行` : ''}`
+  if (!confirm(msg)) return
+  const r = await store.approveDispatchPlan(p.id, approverId.value, '')
+  if (r?.ok) {
+    alert(`计划 ${r.code} 已批准：落地排班 ${r.appliedSchedules?.length || 0} 张、紧急调令 ${r.appliedOts?.length || 0} 条${r.skipped?.length ? `、跳过 ${r.skipped.length} 条` : ''}`)
+    await openPlanDetail(p.id)
+    await loadPlanList()
+  } else alert(r?.msg ? `${r.msg}〔${r.code || ''}〕` : '审批失败')
+}
+async function rejectPlan(p) {
+  const note = prompt(`驳回跨日计划 ${p.code} 的原因（可选）：`, '')
+  if (note === null) return
+  const r = await store.rejectDispatchPlan(p.id, approverId.value, note)
+  if (r?.ok) { await openPlanDetail(p.id); await loadPlanList() }
+  else alert(r?.msg || '驳回失败')
+}
+async function quickNewPlan() {
+  const r = await store.createDispatchPlan({ reason: '主管生成跨日调度预览', horizon: 3, request_id: newRequestId() })
+  if (r?.ok) { await loadPlanList('all'); await openPlanDetail(r.id) }
+  else alert(r?.msg || '生成失败')
+}
+// 进入页签时加载列表
+watch(tab, v => { if (v === 'plans' && !planList.value.length) loadPlanList('pending') })
+function planDayOf(d) { return planDetail.value?.days?.find(x => x.day === d) || null }
 </script>
 
 <template>
@@ -271,6 +352,7 @@ const stats = computed(() => store.schedulingStats)
       <div class="card stat"><span>🕑</span><b>{{ stats.overtimeHoursToday }}h</b><em>今日加班</em></div>
       <div class="card stat"><span>💰</span><b class="money neg">¥{{ (stats.payToday || 0).toLocaleString() }}</b><em>今日工时工资</em></div>
       <div class="card stat" :class="{ alert: stats.pendingRequests }"><span>📝</span><b>{{ stats.pendingRequests }}</b><em>待审批申请</em></div>
+      <div class="card stat" :class="{ alert: stats.pendingPlanCount }"><span>🧾</span><b>{{ stats.pendingPlanCount || 0 }}</b><em>跨日计划待批</em></div>
       <div class="card stat" :class="{ alert: stats.coverageWarnings }"><span>⚠️</span><b>{{ stats.coverageWarnings }}</b><em>覆盖预警</em></div>
     </div>
 
@@ -278,6 +360,7 @@ const stats = computed(() => store.schedulingStats)
       <button v-for="t in tabs" :key="t.k" :class="{ on: tab === t.k }" @click="tab = t.k">
         {{ t.label }}
         <i v-if="t.k === 'requests' && stats.pendingRequests" class="badge-dot">{{ stats.pendingRequests }}</i>
+        <i v-if="t.k === 'plans' && stats.pendingPlanCount" class="badge-dot plan-dot">{{ stats.pendingPlanCount }}</i>
         <i v-if="t.k === 'dispatch' && stats.dispatchOtRequests" class="badge-dot alert-dot">{{ stats.dispatchOtRequests }}</i>
       </button>
       <label class="autofill" v-if="tab === 'board' || tab === 'dispatch'">
@@ -296,6 +379,10 @@ const stats = computed(() => store.schedulingStats)
               融合 <b>分时预约客流</b>（入园 + 热门设施预约，未来日按散客均值外推）、<b>在途检修工单</b>、<b>待处置投诉岗位</b>
               三类需求，按早/中/晚/跨日夜班核算岗位缺口，自动智能补位；当天已开始班段的硬缺口转<b>紧急加班调令</b>走主管审批。
             </p>
+            <p class="muted approval-tip" v-if="approvalMode">
+              🧾 当前为<b>预览审批模式</b>：引擎与各类联动只生成/刷新「跨日计划」待批方案（不直接改排班）；
+              主管在「跨日计划」页审批后原子落地，页面实时复核每条目的可落地性、预估工资与落地后岗位覆盖。
+            </p>
           </div>
           <div class="dh-actions">
             <label class="mode-switch">
@@ -305,8 +392,12 @@ const stats = computed(() => store.schedulingStats)
                 <option value="auto">基础补位（全员轮排日班）</option>
               </select>
             </label>
+            <label class="approval-switch" :class="{ on: approvalMode }">
+              <input type="checkbox" :checked="approvalMode" @change="toggleApprovalMode($event.target.checked)" />
+              跨日计划预览审批（引擎先出方案、主管审批后落地）
+            </label>
             <button class="primary" :disabled="dispatching || !autoFill" @click="runDispatch">
-              {{ dispatching ? '调度中…' : '🚀 立即执行动态补位' }}
+              {{ dispatching ? '生成中…' : (approvalMode ? '🧾 生成跨日计划预览' : '🚀 立即执行动态补位') }}
             </button>
           </div>
         </div>
@@ -385,6 +476,143 @@ const stats = computed(() => store.schedulingStats)
           补位规则：自动选择当日无排班、无前日夜班（疲劳规避）、区域/技能最匹配且近三日负载最低的员工；
           已开始班段的硬需求优先排未开始的邻班接续，仍无法补位时生成紧急加班调令（1.5 倍时薪、主管审批后写入考勤顺延下班）。
         </p>
+      </div>
+    </template>
+
+    <!-- ============ 跨日计划预览与审批 ============ -->
+    <template v-else-if="tab === 'plans'">
+      <!-- 计划列表 -->
+      <div class="card" v-if="!planDetail">
+        <div class="tabs plans-head">
+          <button :class="{ on: planListTab === 'pending' }" @click="loadPlanList('pending')">待审批（{{ stats.pendingPlanCount || 0 }}）</button>
+          <button :class="{ on: planListTab === 'approved' }" @click="loadPlanList('approved')">已批准</button>
+          <button :class="{ on: planListTab === 'rejected' }" @click="loadPlanList('rejected')">已驳回</button>
+          <button :class="{ on: planListTab === 'all' }" @click="loadPlanList('all')">全部</button>
+          <button class="primary sm new-plan" @click="quickNewPlan">🧾 生成跨日预览</button>
+        </div>
+        <div class="plan-list">
+          <div class="plan-row card2" v-for="p in planList" :key="p.id" :class="{ stale: p.stale && p.status === 'pending', auto: p.source === 'auto' }">
+            <div class="pr-main" @click="openPlanDetail(p.id)">
+              <span class="pr-code mono">{{ p.code }}</span>
+              <span class="abadge" :class="PLAN_STATUS_META[p.status]?.cls">{{ PLAN_STATUS_META[p.status]?.label || p.status }}</span>
+              <em class="src-tag" v-if="p.source === 'auto'">🤖 引擎生成</em>
+              <em class="src-tag" v-else>🧑‍💼 主管生成</em>
+              <em class="stale-tag" v-if="p.stale && p.status === 'pending'">🔄 需求已变化，建议重新生成</em>
+              <span class="pr-range">第 {{ p.day_from }} ~ {{ p.day_to }} 天</span>
+            </div>
+            <div class="pr-meta">
+              <span>拟排班 <b>{{ p.schedule_count }}</b></span>
+              <span>紧急调令 <b :class="p.ot_count ? 'neg' : ''">{{ p.ot_count }}</b></span>
+              <span class="money neg">预估工资 ¥{{ (p.est_wage || 0).toLocaleString() }}</span>
+              <span class="muted" v-if="p.applied_schedules || p.applied_ots">已落地 {{ p.applied_schedules + p.applied_ots }}</span>
+            </div>
+            <div class="pr-actions">
+              <button class="ghost sm" @click="openPlanDetail(p.id)">预览/审批</button>
+            </div>
+          </div>
+          <div class="muted empty" v-if="!planList.length && !planListLoading">暂无跨日计划，点击右上角「生成跨日预览」（审批模式下引擎也会自动生成待批方案）。</div>
+        </div>
+      </div>
+
+      <!-- 计划详情 / 审批 -->
+      <div v-else class="plan-detail">
+        <div class="card pd-head">
+          <div class="pdh-row">
+            <h3>🧾 跨日调度计划 {{ planDetail.code }}
+              <span class="abadge" :class="PLAN_STATUS_META[planDetail.status]?.cls">{{ PLAN_STATUS_META[planDetail.status]?.label }}</span>
+              <em class="src-tag" v-if="planDetail.source === 'auto'">🤖 引擎联动生成</em>
+              <em class="stale-tag" v-if="planDetail.stale && planDetail.status === 'pending'">🔄 需求已变化</em>
+            </h3>
+            <button class="ghost sm" @click="closePlanDetail">← 返回列表</button>
+          </div>
+          <p class="muted">第 {{ planDetail.day_from }} ~ {{ planDetail.day_to }} 天 · {{ planDetail.reason || '动态调度按需求补位' }}
+            · 生成于第 {{ planDetail.create_day }} 天</p>
+          <div class="pdh-summary">
+            <span>条目合计 <b>{{ planDetail.item_count }}</b></span>
+            <template v-if="planDetail.status === 'pending'">
+              <span class="pos">✅ 可落地 <b>{{ planDetail.applicableCount }}</b></span>
+              <span class="neg" v-if="planDetail.invalidCount">⛔ 已失效 <b>{{ planDetail.invalidCount }}</b></span>
+              <span class="muted" v-if="planDetail.redundantCount">🟢 缺口已消 <b>{{ planDetail.redundantCount }}</b></span>
+            </template>
+            <template v-else>
+              <span class="pos">已落地 <b>{{ planDetail.applied_schedules + planDetail.applied_ots }}</b></span>
+              <span class="muted" v-if="planDetail.skipped_items">跳过 <b>{{ planDetail.skipped_items }}</b></span>
+            </template>
+            <span class="money neg">预估工资 <b>¥{{ (planDetail.est_wage || 0).toLocaleString() }}</b></span>
+            <span class="muted">其中加班溢价 ¥{{ planDetail.est_ot_wage || 0 }}</span>
+          </div>
+          <div class="pdh-actions" v-if="planDetail.status === 'pending'">
+            <button class="succ" :disabled="!planDetail.applicableCount" @click="approvePlan(planDetail)">
+              ✅ 主管批准并原子落地（{{ planDetail.applicableCount }} 条）
+            </button>
+            <button class="danger" @click="rejectPlan(planDetail)">驳回</button>
+            <em class="muted tips-inline">审批时会再次实时校验：已开始/已离岗/冲突的条目安全跳过；缺口已消的调令不再生成。</em>
+          </div>
+        </div>
+
+        <!-- 每日需求快照 -->
+        <div class="card pd-days">
+          <h4>联动需求快照（预约客流 / 检修工单 / 投诉优先级）</h4>
+          <div class="pdd-grid">
+            <div class="pdd-col" v-for="d in planDetail.days" :key="d.day">
+              <b>第 {{ d.day }} 天{{ d.day === today ? '（今天）' : '' }}</b>
+              <span class="muted sm-text">预测客流 {{ d.flowTotal }} · 在途工单 {{ d.openOrders }} · 待处置投诉 {{ d.openComplaints }}</span>
+              <div class="pdd-bands">
+                <em v-for="b in d.bands" :key="b.key" class="pdd-band" :class="{ block: b.blockCount }">
+                  {{ BAND_META[b.key]?.icon }} {{ BAND_META[b.key]?.name }}
+                  ：🛡{{ b.need_guard }} 🧹{{ b.need_clean }} 🔧{{ b.need_repair }}
+                  <i v-if="b.blockCount" class="neg">⛔{{ b.blockCount }}</i>
+                  <i v-else-if="b.warningCount" class="warn-text">⚠{{ b.warningCount }}</i>
+                </em>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 计划条目 -->
+        <div class="card pd-items">
+          <h4>计划条目（{{ planDetail.items.length }}）· 按推演顺序</h4>
+          <div class="pitem" v-for="it in planDetail.items" :key="it.id" :class="it.check?.state">
+            <div class="pi-line">
+              <div class="pi-left">
+                <span class="pi-kind" :class="it.kind">{{ it.kind === 'overtime' ? '🆘 紧急调令' : '📅 新增排班' }}</span>
+                <b>{{ it.staff_name }}</b>
+                <em class="muted">{{ it.staff_role }}</em>
+                <span class="tag">{{ BAND_META[it.band]?.icon }} {{ BAND_META[it.band]?.name }}</span>
+                <span class="tag" v-if="it.kind === 'schedule'">{{ it.shift_name }}</span>
+                <span class="tag" v-else>加班 +{{ it.ot_ticks }}h（1.5×）</span>
+                <span class="tag day-tag">第 {{ it.day }} 天</span>
+                <i class="dot-sh" :style="{ background: it.shift_color }"></i>
+              </div>
+              <div class="pi-right">
+                <span class="money neg">¥{{ it.est_wage }}</span>
+                <span class="abadge it-badge" :class="ITEM_STATE_META[it.check?.state]?.cls">
+                  {{ ITEM_STATE_META[it.check?.state]?.label || it.status }}
+                </span>
+              </div>
+            </div>
+            <div class="pi-note muted">{{ it.note }}</div>
+            <div class="pi-reasons" v-if="it.reason_obj?.orders?.length || it.reason_obj?.complaints?.length">
+              <em v-for="o in it.reason_obj.orders" :key="'o'+o.id" class="ref-order" :class="o.status">🔧 {{ o.code }} · {{ o.ride }} · 优先级{{ o.priority }}</em>
+              <em v-for="c in it.reason_obj.complaints" :key="'c'+c.id" class="ref-comp" :class="'sev'+c.severity">
+                投诉 {{ c.code }} · {{ c.roles?.join('/') }} · 优先级{{ c.priority }}
+              </em>
+            </div>
+            <div class="pi-skip muted" v-if="it.check?.reason">跳过原因：{{ it.check.reason }}〔{{ it.check.code }}〕</div>
+          </div>
+        </div>
+
+        <!-- 落地后覆盖 -->
+        <div class="card pd-residual">
+          <h4>模拟落地后岗位覆盖残余缺口</h4>
+          <div class="pdr-row" v-for="r in planDetail.residual" :key="r.day">
+            <b>第 {{ r.day }} 天</b>
+            <span class="muted">花名册 {{ r.rosterCount }} 人</span>
+            <span v-if="r.blocks" class="neg">⛔ {{ r.blocks }} 项硬缺岗</span>
+            <span v-else-if="r.warnings" class="warn-text">⚠️ {{ r.warnings }} 项预警（审批后将自动生成新待批计划补齐）</span>
+            <span v-else class="pos">✅ 覆盖齐全</span>
+          </div>
+        </div>
       </div>
     </template>
 
@@ -747,4 +975,63 @@ const stats = computed(() => store.schedulingStats)
 .modal { width: 560px; max-width: 92vw; max-height: 80vh; overflow-y: auto; }
 .tl { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 8px 4px; border-bottom: 1px dashed var(--border); font-size: 13px; }
 .tl .tl-time { font-size: 11px; min-width: 74px; }
+
+/* 审批模式开关 */
+.approval-switch { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; max-width: 320px; }
+.approval-switch.on { border-color: rgba(109,213,160,.5); background: rgba(109,213,160,.08); color: var(--green); }
+.approval-tip { margin-top: 4px; padding: 6px 10px; background: rgba(109,213,160,.07); border-left: 3px solid var(--green); border-radius: 0 8px 8px 0; }
+.badge-dot.plan-dot { background: var(--green); }
+
+/* 跨日计划列表 */
+.plans-head { justify-content: flex-start; }
+.new-plan { margin-left: auto; }
+.plan-list { display: flex; flex-direction: column; gap: 10px; }
+.plan-row { display: flex; align-items: center; gap: 16px; padding: 12px 14px; }
+.plan-row.stale { border-color: rgba(255,209,102,.5); }
+.plan-row.auto { border-left: 3px solid var(--blue); }
+.pr-main { display: flex; align-items: center; gap: 10px; flex: 1; cursor: pointer; flex-wrap: wrap; }
+.pr-main:hover .pr-code { color: var(--accent); }
+.pr-code { font-weight: 700; }
+.pr-range { font-size: 12px; color: var(--muted); }
+.pr-meta { display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+.pr-meta b { color: var(--text); margin-left: 2px; }
+.abadge.st-pending { color: var(--accent2); border-color: rgba(255,209,102,.5); background: rgba(255,209,102,.1); }
+.abadge.st-approved { color: var(--green); border-color: rgba(109,213,160,.5); background: rgba(109,213,160,.1); }
+.abadge.st-rejected { color: var(--red); border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.1); }
+.abadge.st-obsolete { color: var(--muted); }
+.stale-tag { font-style: normal; font-size: 11px; color: var(--accent2); padding: 2px 8px; border-radius: 10px; background: rgba(255,209,102,.12); }
+
+/* 计划详情 */
+.plan-detail { display: flex; flex-direction: column; gap: 12px; }
+.pdh-row { display: flex; justify-content: space-between; align-items: center; }
+.pdh-row h3 { margin: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pdh-summary { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin: 8px 0; }
+.pdh-summary b { color: var(--text); margin: 0 2px; }
+.pdh-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.tips-inline { font-size: 12px; }
+.pd-days h4, .pd-items h4, .pd-residual h4 { margin: 0 0 10px; font-size: 14px; }
+.pdd-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.pdd-col { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-radius: 10px; padding: 10px; background: var(--panel2); }
+.pdd-bands { display: flex; flex-direction: column; gap: 4px; }
+.pdd-band { font-style: normal; font-size: 12px; padding: 3px 8px; border-radius: 8px; background: rgba(255,255,255,.03); }
+.pdd-band.block { background: rgba(255,107,107,.08); }
+.pdd-band i { font-style: normal; margin-left: 6px; }
+.warn-text { color: var(--accent2); }
+.sm-text { font-size: 11px; }
+.pitem { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--panel2); display: flex; flex-direction: column; gap: 6px; }
+.pitem.invalid, .pitem.skipped { opacity: .75; }
+.pi-line { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.pi-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.pi-right { display: flex; align-items: center; gap: 10px; }
+.pi-kind { font-weight: 700; font-size: 12px; }
+.pi-kind.schedule { color: var(--blue); }
+.pi-kind.overtime { color: var(--red); }
+.pi-note { font-size: 12px; }
+.pi-reasons { display: flex; gap: 6px; flex-wrap: wrap; }
+.pi-skip { font-size: 12px; color: var(--accent2); }
+.it-badge.it-ok { color: var(--green); border-color: rgba(109,213,160,.5); background: rgba(109,213,160,.1); }
+.it-badge.it-bad { color: var(--red); border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.1); }
+.it-badge.it-skip { color: var(--muted); }
+.pdr-row { display: flex; gap: 14px; align-items: center; padding: 8px 0; border-bottom: 1px dashed var(--border); font-size: 13px; flex-wrap: wrap; }
+.day-tag { color: var(--purple) !important; }
 </style>

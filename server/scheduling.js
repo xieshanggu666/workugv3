@@ -674,10 +674,11 @@ function countByBand(list, day, bandKey, roleCheck) {
 // 排班/调班后校验当日岗位覆盖：客流/检修/投诉需求与班段在岗对比，给出量化缺口预警
 // - warn：未来班段/未来日缺口，可由动态调度自动补位或主管调班补齐；
 // - block：当天班段已经开始且在岗不足（检修中工单/紧急投诉无匹配岗位时升级为 block）
-export function coverageForDay(day) {
+// opts.list 可传入叠加计划虚拟占用的花名册（计划预览「落地后覆盖」对比用）
+export function coverageForDay(day, { list: overrideList = null } = {}) {
   day = Math.round(num(day))
   const warnings = []
-  const list = roster(day)
+  const list = overrideList || roster(day)
   const push = (type, level, msg, extra = {}) => warnings.push({ type, level, msg, ...extra })
   const isToday = day === ctx.day()
   const t = ctx.tick()
@@ -771,9 +772,10 @@ function dispatchCandidates(day, roles, zoneId = null) {
 
 // 计算某日班段 × 岗位缺口（直接以需求画像为事实源，避免从预警文案反推）
 // 动态调度视角：当天班段进行中时，已排进本班段但尚未打卡的人也计入（引擎到点自动打卡/稍后补打卡）
-export function gapsForDay(day, { forDispatch = true } = {}) {
+// opts.list 可传入叠加了计划虚拟占用的花名册（跨日计划 dry-run 推演用）
+export function gapsForDay(day, { forDispatch = true, list = null } = {}) {
   const demand = demandForDay(day)
-  const list = roster(day)
+  list = list || roster(day)
   const t = ctx.tick()
   const countRole = (bandKey, roles) => list.filter(s => {
     if (!roles.includes(s.role)) return false
@@ -819,86 +821,20 @@ export function gapsForDay(day, { forDispatch = true } = {}) {
   return { demand, gaps }
 }
 
-// 按需求画像为未来 horizon 天（含当天）补齐缺口；返回补位明细。
-// 当天未开始班段：正常补排；已开始班段：硬需求（检修/投诉）允许跨班段临班补排（未开始且时段重叠的邻班，
-// 如中班缺维修工 → 排未开始的晚班，14 点到岗后即可接单）；仍补不上的缺口转为紧急加班调令（主管审批）。
-export function runDynamicDispatch({ horizon = 3, reason = '', urgentOvertime = false } = {}) {
-  const created = []
-  const otRequests = []
-  const today = ctx.day()
+// 紧急加班调令落库：给在岗员工生成一条 source='dispatch' 的待审批加班申请（计划审批与即时调度共用）
+function insertUrgentOvertime({ staffId, scheduleId, day, ticks, reason }) {
   const t = ctx.tick()
-  const shifts = listShiftTemplates({ activeOnly: true })
-
-  for (let d = today; d <= today + horizon - 1; d++) {
-    // 当日班段处理顺序：硬需求（检修/投诉）按统一优先级最高的班段先补，其次缺口人数；
-    // 保证紧急检修/临期投诉先占到人（跨日班次的昨日夜班不参与今日日班补位）
-    const gapRank = gapsForDay(d).gaps
-    const bandRank = new Map(BANDS.map(b => [b.key, 0]))
-    for (const g of gapRank) {
-      bandRank.set(g.band, Math.max(bandRank.get(g.band) || 0, (g.hard ? 1000 : 0) + g.priority * 2 + g.gap))
-    }
-    const dayBands = [...BANDS].sort((a, b2) => (bandRank.get(b2.key) || 0) - (bandRank.get(a.key) || 0))
-    // 逐班段 × 岗位缺口补位；每补一个人都会影响候选池与缺口数，故每轮实时重算
-    for (const band of dayBands) {
-      for (let pass = 0; pass < 24; pass++) {
-        // 该班段仍未消解的全部岗位缺口，按硬需求 → 统一优先级 → 缺口人数排序补位
-        const gapsNow = gapsForDay(d).gaps
-          .filter(x => x.band === band.key && x.gap > 0)
-          .sort((a, b2) => Number(b2.hard) - Number(a.hard) || b2.priority - a.priority || b2.gap - a.gap)
-        if (!gapsNow.length) break
-        const g = gapsNow[0]
-        const sh = shifts.find(x => x.code === band.shift_code)
-        if (!sh) break
-        const curHour = OPEN_HOUR + (t - linear(d, OPEN_HOUR))
-        const bandEndHour = band.hours[band.hours.length - 1] + 1
-        const bandStarted = d === today && curHour >= sh.start_hour
-        const bandLive = d !== today || curHour < bandEndHour
-
-        // 目标班次：班段未开始/进行中 → 本班（进行中用 allowStarted 放进班，引擎随后自动打卡）；
-        // 班段已过的硬需求 → 当日未开始且与缺口时段重叠的最近邻班接续；其余缺口不再补排（转加班调令）
-        let target = null
-        let allowStarted = false
-        let noteSuffix = ''
-        if (!bandStarted || bandLive) {
-          target = sh
-          allowStarted = bandStarted
-        } else if (g.hard) {
-          target = shifts
-            .filter(x => !x.cross_day && x.start_hour > curHour && x.start_hour <= band.hours[band.hours.length - 1])
-            .sort((a, b2) => a.start_hour - b2.start_hour)[0] || null
-          if (target) noteSuffix = `（原${band.label}已过，${target.name}接续补位）`
-        }
-        if (!target) break
-        // 区域/技能匹配：维修缺口优先派给检修工单所在区域的维修工（gaps 已含工单 zone_id）
-        const zoneId = g.orders?.[0]?.zone_id ?? null
-        const cand = dispatchCandidates(d, g.roles, zoneId)[0]
-        if (!cand) break
-        const rr = createSchedule({
-          staffId: cand.id, shiftId: target.id, day: d, source: 'dispatch',
-          note: reason ? `动态调度：${reason}${noteSuffix}` : `动态调度补${band.label}${g.role}缺口${noteSuffix}`,
-          requestId: `disp-${d}-${target.id}-${cand.id}-${band.key}-${pass}`,
-          allowStarted
-        })
-        if (!rr.ok) break
-        created.push({ id: rr.id, code: rr.code, staff_id: cand.id, staff_name: cand.name, day: d, band: band.key, shift: target.code })
-      }
-    }
-
-    // 班段补排全部尝试后，仍存在的当天已开始班段缺口 → 紧急加班调令（相邻班段在岗员工，主管审批）
-    // 按统一优先级（检修/投诉紧急度）先发调令，避免有限的可加班人力被低优先缺口占用
-    if (urgentOvertime) {
-      const urgentGaps = gapsForDay(d).gaps
-        .filter(g => {
-          const sh = shifts.find(x => x.code === BANDS.find(b => b.key === g.band).shift_code)
-          return sh && d === today && linear(d, sh.start_hour) <= t
-        })
-        .sort((a, b2) => Number(b2.hard) - Number(a.hard) || b2.priority - a.priority)
-      for (const g of urgentGaps) {
-        otRequests.push(...createUrgentOvertime(d, g, reason))
-      }
-    }
-  }
-  return { ok: true, created, otRequests, days: horizon }
+  const id = Number(db.prepare(`INSERT INTO shift_requests(kind,staff_id,schedule_id,day,ot_ticks,reason,status,source,create_tick,create_day)
+                               VALUES('overtime',?,?,?,?,?, 'pending','dispatch',?,?)`)
+    .run(staffId, scheduleId, day, ticks, String(reason).slice(0, 200), t, day).lastInsertRowid)
+  const code = 'TB' + String(id).padStart(4, '0')
+  db.prepare('UPDATE shift_requests SET code=? WHERE id=?').run(code, id)
+  const s = db.prepare('SELECT s.name staff_name FROM staff s WHERE s.id=?').get(staffId)
+  logShift({
+    scheduleId, requestId: id, action: 'ot_request',
+    note: `动态调度生成紧急加班调令：${s?.staff_name || staffId}加班 ${ticks}h，待主管审批`, staffId
+  })
+  return { id, code, staff_id: staffId, schedule_id: scheduleId, ticks }
 }
 
 // 紧急加班调令：班段已开始且补不上人时，给相邻班段在岗、岗位匹配的员工生成系统加班申请（主管审批）
@@ -923,21 +859,242 @@ function createUrgentOvertime(day, gap, reason) {
     if (sh.end_hour + att.overtime_ticks + ticks > CLOSE_HOUR) continue
     const dup = db.prepare("SELECT id FROM shift_requests WHERE kind='overtime' AND status='pending' AND schedule_id=?").get(s.schedule_id)
     if (dup) continue
-    const id = Number(db.prepare(`INSERT INTO shift_requests(kind,staff_id,schedule_id,day,ot_ticks,reason,status,source,create_tick,create_day)
-                                 VALUES('overtime',?,?,?,?,?, 'pending','dispatch',?,?)`)
-      .run(s.id, s.schedule_id, day, ticks,
-        `系统紧急调令：${gap.band === 'morning' ? '早' : gap.band === 'mid' ? '中' : '晚'}班${gap.role}缺岗 ${gap.gap} 人${reason ? `（${reason}）` : ''}，请加班补位`,
-        t, day).lastInsertRowid)
-    const code = 'TB' + String(id).padStart(4, '0')
-    db.prepare('UPDATE shift_requests SET code=? WHERE id=?').run(code, id)
-    logShift({
-      scheduleId: s.schedule_id, attendanceId: att.id, requestId: id, action: 'ot_request',
-      note: `动态调度生成紧急加班调令：${s.name}${gap.role}加班 ${ticks}h 补 ${gap.band}班缺口，待主管审批`, staffId: s.id
-    })
-    out.push({ id, code, staff_id: s.id, ticks })
+    out.push(insertUrgentOvertime({ staffId: s.id, scheduleId: s.schedule_id, day, ticks,
+      reason: `系统紧急调令：${gap.band === 'morning' ? '早' : gap.band === 'mid' ? '中' : '晚'}班${gap.role}缺岗 ${gap.gap} 人${reason ? `（${reason}）` : ''}，请加班补位` }))
     need--
   }
   return out
+}
+
+// ---------------- 跨日计划 dry-run（虚拟推演，不落库） ----------------
+// 虚拟占用：key=`${day}:${staffId}` → { day, staffId, shiftId, crossDay, seq }
+// 计划推演时模拟「本条排班已存在」，使后续缺口计算、疲劳规避与候选选人与真实落库口径一致。
+function virtualRoster(day, occ) {
+  if (!occ || !occ.size) return roster(day)
+  const list = roster(day)
+  for (const v of occ.values()) {
+    if (v.day !== day && !(v.crossDay && v.day === day - 1)) continue
+    const st = getStaff(v.staffId)
+    const sh = getShift(v.shiftId)
+    if (!st || !sh) continue
+    const begin = linear(v.day, sh.start_hour)
+    const end = sh.crossDay ? linear(v.day + 1, sh.end_hour) : linear(v.day, sh.end_hour)
+    list.push({
+      id: v.staffId, staff_id: v.staffId, name: st.name, role: st.role, wage: st.wage,
+      zone_id: st.zone_id, active: 1, skill: st.skill,
+      schedule_id: -(v.seq || 0), sched_day: v.day, sched_status: 'scheduled', sched_source: 'plan',
+      shift_id: sh.id, shift_code: sh.code, shift_name: sh.name,
+      start_hour: sh.start_hour, end_hour: sh.end_hour, cross_day: sh.cross_day,
+      color: sh.color, standard_hours: sh.standard_hours,
+      att_id: null, att_status: '', overtime_ticks: 0, late: 0,
+      begin_linear: begin, end_linear: end, on_duty_now: false, virtual: true
+    })
+  }
+  return list
+}
+
+// 虚拟候选：在真实库过滤之上叠加计划内占用（同日不重复、虚拟前夜跨日夜班疲劳规避）
+function virtualCandidates(day, roles, zoneId, occ) {
+  return db.prepare("SELECT * FROM staff WHERE active=1 AND role<>'运营主管' ORDER BY id").all()
+    .filter(st => roles.includes(st.role))
+    .filter(st => !effectiveScheduleOf(st.id, day))
+    .filter(st => !workedNightBefore(st.id, day))
+    .filter(st => !occ.has(`${day}:${st.id}`))
+    .filter(st => {
+      const prev = occ.get(`${day - 1}:${st.id}`)
+      return !(prev && prev.crossDay)
+    })
+    .sort((a, b) => {
+      const za = zoneId ? (a.zone_id === zoneId ? 0 : 1) : 0
+      const zb = zoneId ? (b.zone_id === zoneId ? 0 : 1) : 0
+      if (za !== zb) return za - zb
+      const loadA = db.prepare(`SELECT COUNT(*) n FROM staff_schedules WHERE staff_id=? AND day BETWEEN ? AND ? AND ${EFFECTIVE}`).get(a.id, day, day + 2).n
+        + [...occ.values()].filter(v => v.staffId === a.id && v.day >= day && v.day <= day + 2).length
+      const loadB = db.prepare(`SELECT COUNT(*) n FROM staff_schedules WHERE staff_id=? AND day BETWEEN ? AND ? AND ${EFFECTIVE}`).get(b.id, day, day + 2).n
+        + [...occ.values()].filter(v => v.staffId === b.id && v.day >= day && v.day <= day + 2).length
+      return loadA - loadB || b.skill - a.skill
+    })
+}
+
+// 缺口依据快照（预览/审批页可追溯：预约客流峰值、检修工单、投诉统一优先级分值）
+function gapReasonSnapshot(g, band) {
+  return {
+    band: g.band, role: g.role, need: g.need, have: g.have, gap: g.gap,
+    hard: !!g.hard, priority: g.priority,
+    flow: band?.flow || 0, peak: band?.peak || 0,
+    orders: (g.orders || []).map(o => ({ id: o.id, code: o.code, status: o.status, ride: o.ride_name, priority: o.priority })),
+    complaints: (g.complaints || []).map(c => ({
+      id: c.id, code: c.code, severity: c.severity, status: c.status, priority: c.priority, roles: c.roles || []
+    }))
+  }
+}
+function gapNoteText(snap, suffix = '') {
+  const label = (BANDS.find(b => b.key === snap.band)?.label) || snap.band
+  const parts = [`补${label}${snap.role}缺口 ${snap.gap} 人（班段峰值客流 ${snap.peak} 人）`]
+  if (snap.orders.length) parts.push(`检修工单 ${snap.orders.slice(0, 2).map(o => o.code).join('、')}`)
+  if (snap.complaints.length) parts.push(`投诉 ${snap.complaints.slice(0, 2).map(c => `${c.code}·优先级${c.priority}`).join('、')}`)
+  return parts.join('；') + suffix
+}
+
+// 虚拟紧急加班调令：推演时不写 shift_requests，只产出计划条目描述
+function virtualUrgentOvertime(day, gap, reason, occ, vOt) {
+  const out = []
+  const t = ctx.tick()
+  const onDuty = roster(day).filter(s => s.on_duty_now && !s.cross_day)
+  const roles = ROLES_BY_NAME[gap.role] || ROLES_BY_NAME['维修工']
+  let need = gap.gap
+  for (const s of onDuty) {
+    if (need <= 0) break
+    if (!roles.includes(s.role)) continue
+    const sh = getShift(s.shift_id)
+    if (!sh) continue
+    const att = db.prepare('SELECT * FROM staff_attendance WHERE schedule_id=?').get(s.schedule_id)
+    if (!att || att.status !== 'checked_in') continue
+    const curHour = OPEN_HOUR + (t - linear(day, OPEN_HOUR))
+    const bandEnd = gap.band === 'morning' ? 14 : gap.band === 'mid' ? 17 : CLOSE_HOUR
+    const ticks = Math.min(4, Math.max(1, bandEnd - curHour - att.overtime_ticks))
+    if (sh.end_hour + att.overtime_ticks + ticks > CLOSE_HOUR) continue
+    const dup = db.prepare("SELECT id FROM shift_requests WHERE kind='overtime' AND status='pending' AND schedule_id=?").get(s.schedule_id)
+    if (dup) continue
+    if (vOt.some(o => o.scheduleId === s.schedule_id)) continue
+    const item = {
+      kind: 'overtime', day, band: gap.band, role: gap.role, staffId: s.id,
+      shiftId: s.shift_id, scheduleId: s.schedule_id, ticks,
+      reason: `系统紧急调令：${(BANDS.find(b => b.key === gap.band)?.label) || ''}${gap.role}缺岗 ${gap.gap} 人${reason ? `（${reason}）` : ''}，请加班补位`
+    }
+    vOt.push({ scheduleId: s.schedule_id })
+    out.push(item)
+    need--
+  }
+  return out
+}
+
+// 调度推演核心：sim=false 即时落库（原动态调度行为）；sim=true 只产出跨日计划条目（dry-run 预览）
+function dispatchCore({ horizon = 3, reason = '', urgentOvertime = false, sim = false } = {}) {
+  const occ = sim ? new Map() : null
+  const vOt = sim ? [] : null
+  const created = []
+  const otRequests = []
+  const items = []
+  let seq = 0
+  const today = ctx.day()
+  const t = ctx.tick()
+  const shifts = listShiftTemplates({ activeOnly: true })
+  const listOf = d => sim ? virtualRoster(d, occ) : roster(d)
+
+  for (let d = today; d <= today + horizon - 1; d++) {
+    // 当日班段处理顺序：硬需求（检修/投诉）按统一优先级最高的班段先补，其次缺口人数；
+    // 保证紧急检修/临期投诉先占到人（跨日班次的昨日夜班不参与今日日班补位）
+    const gapRank = gapsForDay(d, { list: listOf(d) }).gaps
+    const bandRank = new Map(BANDS.map(b => [b.key, 0]))
+    for (const g of gapRank) {
+      bandRank.set(g.band, Math.max(bandRank.get(g.band) || 0, (g.hard ? 1000 : 0) + g.priority * 2 + g.gap))
+    }
+    const dayBands = [...BANDS].sort((a, b2) => (bandRank.get(b2.key) || 0) - (bandRank.get(a.key) || 0))
+    // 逐班段 × 岗位缺口补位；每补一个人都会影响候选池与缺口数，故每轮实时重算
+    for (const band of dayBands) {
+      for (let pass = 0; pass < 24; pass++) {
+        // 该班段仍未消解的全部岗位缺口，按硬需求 → 统一优先级 → 缺口人数排序补位
+        const gd = gapsForDay(d, { list: listOf(d) })
+        const gapsNow = gd.gaps
+          .filter(x => x.band === band.key && x.gap > 0)
+          .sort((a, b2) => Number(b2.hard) - Number(a.hard) || b2.priority - a.priority || b2.gap - a.gap)
+        if (!gapsNow.length) break
+        const g = gapsNow[0]
+        const bandDemand = gd.demand.bands.find(x => x.key === band.key)
+        const sh = shifts.find(x => x.code === band.shift_code)
+        if (!sh) break
+        const curHour = OPEN_HOUR + (t - linear(d, OPEN_HOUR))
+        const bandEndHour = band.hours[band.hours.length - 1] + 1
+        const bandStarted = d === today && curHour >= sh.start_hour
+        const bandLive = d !== today || curHour < bandEndHour
+
+        // 目标班次：班段未开始/进行中 → 本班（进行中用 allowStarted 放进班，引擎随后自动打卡）；
+        // 班段已过的硬需求 → 当日未开始且与缺口时段重叠的最近邻班接续；其余缺口不再补排（转加班调令）
+        let target = null
+        let allowStarted = false
+        let noteSuffix = ''
+        if (!bandStarted || bandLive) {
+          target = sh
+          allowStarted = bandStarted
+        } else if (g.hard) {
+          target = shifts
+            .filter(x => !x.cross_day && x.start_hour > curHour && x.start_hour <= band.hours[band.hours.length - 1])
+            .sort((a, b2) => a.start_hour - b2.start_hour)[0] || null
+          if (target) noteSuffix = '（原班段已过，邻班接续补位）'
+        }
+        if (!target) break
+        // 区域/技能匹配：维修缺口优先派给检修工单所在区域的维修工（gaps 已含工单 zone_id）
+        const zoneId = g.orders?.[0]?.zone_id ?? null
+        const cand = sim
+          ? virtualCandidates(d, g.roles, zoneId, occ)[0]
+          : dispatchCandidates(d, g.roles, zoneId)[0]
+        if (!cand) break
+        const note = reason
+          ? `动态调度：${reason}${noteSuffix}`
+          : `动态调度补${band.label}${g.role}缺口${noteSuffix}`
+        if (sim) {
+          seq += 1
+          occ.set(`${d}:${cand.id}`, { day: d, staffId: cand.id, shiftId: target.id, crossDay: target.cross_day ? 1 : 0, seq })
+          const snap = gapReasonSnapshot(g, bandDemand)
+          items.push({
+            kind: 'schedule', seq, day: d, band: band.key, role: g.role, staffId: cand.id,
+            shiftId: target.id, allowStarted: allowStarted ? 1 : 0,
+            estWage: Math.round(hourlyWage(cand.wage) * num(target.standard_hours, 5)),
+            reasonSnap: snap, note: gapNoteText(snap, noteSuffix)
+          })
+        } else {
+          const rr = createSchedule({
+            staffId: cand.id, shiftId: target.id, day: d, source: 'dispatch', note,
+            requestId: `disp-${d}-${target.id}-${cand.id}-${band.key}-${pass}`,
+            allowStarted
+          })
+          if (!rr.ok) break
+          created.push({ id: rr.id, code: rr.code, staff_id: cand.id, staff_name: cand.name, day: d, band: band.key, shift: target.code })
+        }
+      }
+    }
+
+    // 班段补排全部尝试后，仍存在的当天已开始班段缺口 → 紧急加班调令（相邻班段在岗员工，主管审批）
+    // 按统一优先级（检修/投诉紧急度）先发调令，避免有限的可加班人力被低优先缺口占用
+    if (urgentOvertime) {
+      const urgentGaps = gapsForDay(d, { list: listOf(d) }).gaps
+        .filter(g => {
+          const sh2 = shifts.find(x => x.code === BANDS.find(b => b.key === g.band).shift_code)
+          return sh2 && d === today && linear(d, sh2.start_hour) <= t
+        })
+        .sort((a, b2) => Number(b2.hard) - Number(a.hard) || b2.priority - a.priority)
+      for (const g of urgentGaps) {
+        if (sim) {
+          for (const item of virtualUrgentOvertime(d, g, reason, occ, vOt)) {
+            seq += 1
+            const cand = getStaff(item.staffId)
+            const otMul = num(getSetting('otRateMul'), 1.5)
+            const snap = gapReasonSnapshot(g, null)
+            items.push({
+              kind: 'overtime', seq, day: item.day, band: item.band, role: item.role, staffId: item.staffId,
+              shiftId: item.shiftId, scheduleId: item.scheduleId, ticks: item.ticks,
+              allowStarted: 0,
+              estWage: Math.round(hourlyWage(cand?.wage ?? 300) * otMul * item.ticks),
+              reasonSnap: snap,
+              note: `紧急加班调令 ${item.ticks}h（1.5 倍时薪）补${(BANDS.find(b => b.key === g.band)?.label) || g.band}${g.role}缺口`
+            })
+          }
+        } else {
+          otRequests.push(...createUrgentOvertime(d, g, reason))
+        }
+      }
+    }
+  }
+  return { ok: true, sim, created, otRequests, items, occ, horizon, days: horizon }
+}
+
+// 按需求画像为未来 horizon 天（含当天）补齐缺口；返回补位明细。
+// 当天未开始班段：正常补排；已开始班段：硬需求（检修/投诉）允许跨班段临班补排（未开始且时段重叠的邻班，
+// 如中班缺维修工 → 排未开始的晚班，14 点到岗后即可接单）；仍补不上的缺口转为紧急加班调令（主管审批）。
+export function runDynamicDispatch(opts = {}) {
+  const r = dispatchCore(opts)
+  return { ok: true, created: r.created, otRequests: r.otRequests, days: r.days }
 }
 
 // 操作联动钩子：调班批准/取消/解雇/报修/投诉建单后触发（受自动补位总开关与动态模式约束）
@@ -945,11 +1102,379 @@ export function maybeDispatchAfter(reason = '岗位需求变化') {
   if (!num(getSetting('scheduleAutoFill'), 1)) return { ok: true, skipped: true }
   if (getSetting('scheduleMode', 'dynamic') !== 'dynamic') return { ok: true, skipped: true }
   try {
+    // 审批模式：不直接补位，刷新待主管审批的跨日计划预览（预约客流/检修工单/投诉优先级变化联动）
+    if (num(getSetting('scheduleApproval'), 0)) return refreshAutoDispatchPlan(reason)
     return runDynamicDispatch({ reason })
   } catch (e) {
     console.error('[scheduling] 联动动态调度失败（不影响主操作）:', e)
     return { ok: false, msg: '动态调度失败' }
   }
+}
+
+// ---------------- 跨日计划：预览生成 → 主管审批 → 原子落地 ----------------
+// 需求指纹：把未来 horizon 天「班段×岗位需求 + 关联工单/投诉」串成签名；
+// 计划读取时重算，与生成时快照不一致即标记「需求已变化，请重新生成」，避免按过时画像审批。
+function demandSignature(dayFrom, horizon) {
+  const parts = []
+  for (let d = dayFrom; d < dayFrom + horizon; d++) {
+    const { bands } = demandForDay(d)
+    for (const b of bands) {
+      parts.push([d, b.key, b.need_guard, b.need_clean, b.need_repair,
+        (b.orders || []).map(o => `${o.id}:${o.status}:${Math.round(o.progress)}`).join(','),
+        (b.complaints || []).map(c => `${c.id}:${c.status}:${c.severity}`).join(',')].join('|'))
+    }
+  }
+  return parts.join('#')
+}
+
+// 计划生成时每日需求快照（预览页与审批页展示：客流/工单/投诉/覆盖）
+function planDaySnapshot(d) {
+  const cov = coverageForDay(d)
+  return {
+    day: d,
+    flowTotal: cov.demand.flowTotal,
+    reserveTotal: cov.demand.reserveTotal,
+    groupTotal: cov.demand.groupTotal,
+    walkinTotal: cov.demand.walkinTotal,
+    openOrders: cov.demand.openOrders,
+    openComplaints: cov.demand.openComplaints,
+    rosterCount: cov.rosterCount,
+    bands: cov.demand.bands.map(b => ({
+      key: b.key, flow: b.flow, peak: b.peak,
+      need_guard: b.need_guard, need_clean: b.need_clean, need_repair: b.need_repair,
+      orders: (b.orders || []).map(o => ({ id: o.id, code: o.code, status: o.status, ride: o.ride_name, priority: o.priority })),
+      complaints: (b.complaints || []).map(c => ({
+        id: c.id, code: c.code, severity: c.severity, status: c.status, priority: c.priority, roles: c.roles || []
+      })),
+      warningCount: cov.warnings.filter(w => w.band === b.key).length,
+      blockCount: cov.warnings.filter(w => w.band === b.key && w.level === 'block').length
+    }))
+  }
+}
+
+// 生成跨日调度计划（dry-run）：推演未来 horizon 天的补位排班与紧急加班调令，只落计划单、不动真实排班。
+// source=manual 主管手动「生成预览」；source=auto 引擎/联动自动生成待批计划。
+export function createDispatchPlan({ horizon = 3, reason = '', source = 'manual', requestId = '' } = {}) {
+  return idempotent('dispatch_plan_create', requestId, () => {
+    try {
+      return tx(() => {
+        horizon = Math.max(1, Math.min(7, Math.round(num(horizon, 3))))
+        const today = ctx.day()
+        const sim = dispatchCore({ horizon, reason, urgentOvertime: true, sim: true })
+        const items = sim.items
+        const src = source === 'auto' ? 'auto' : 'manual'
+        const days = []
+        for (let d = today; d < today + horizon; d++) days.push(planDaySnapshot(d))
+        const sig = demandSignature(today, horizon)
+        const estWage = items.reduce((s, it) => s + it.estWage, 0)
+        const schedItems = items.filter(it => it.kind === 'schedule')
+        const otItems = items.filter(it => it.kind === 'overtime')
+        const id = Number(db.prepare(`INSERT INTO dispatch_plans
+            (status,source,horizon,day_from,day_to,reason,demand_snapshot,demand_signature,
+             est_wage,est_ot_wage,item_count,schedule_count,ot_count,create_tick,create_day)
+            VALUES('pending',?,?,?, ?,?,?, ?,?,?, ?,?,?,?,?)`)
+          .run(src, horizon, today, today + horizon - 1, String(reason).slice(0, 160),
+            JSON.stringify({ days }), sig,
+            estWage, otItems.reduce((s, it) => s + it.estWage, 0),
+            items.length, schedItems.length, otItems.length, ctx.tick(), today).lastInsertRowid)
+        const code = 'JH' + String(id).padStart(4, '0')
+        db.prepare('UPDATE dispatch_plans SET code=? WHERE id=?').run(code, id)
+        const insItem = db.prepare(`INSERT INTO dispatch_plan_items
+            (plan_id,seq,kind,day,band,role,staff_id,shift_id,schedule_id,ot_ticks,status,est_wage,allow_started,reason_snapshot,note)
+            VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`)
+        for (const it of items) {
+          insItem.run(id, it.seq, it.kind, it.day, it.band, it.role, it.staffId,
+            it.shiftId ?? null, it.scheduleId ?? null, it.ticks || 0, it.estWage, it.allowStarted || 0,
+            JSON.stringify(it.reasonSnap || {}), String(it.note || '').slice(0, 200))
+        }
+        // 引擎自动计划：同时只保留一份 auto 待批计划，旧的 auto 待批计划标记 obsolete（手动计划不互相作废）
+        if (src === 'auto') {
+          db.prepare("UPDATE dispatch_plans SET status='obsolete', handle_tick=?, handle_day=? WHERE status='pending' AND source='auto' AND id<>?")
+            .run(ctx.tick(), today, id)
+        }
+        return { ok: true, id, code, itemCount: items.length, scheduleCount: schedItems.length, otCount: otItems.length, estWage }
+      })
+    } catch (e) {
+      console.error('[scheduling] 跨日调度计划生成失败，已整体回滚:', e)
+      return fail('TX_FAILED', '系统繁忙，跨日计划未生成，请稍后重试')
+    }
+  })
+}
+
+// 审批模式联动钩子：需求变化时刷新引擎 auto 待批计划（同需求指纹去重，避免每小时重复建单）
+export function refreshAutoDispatchPlan(reason = '引擎需求巡检') {
+  if (!num(getSetting('scheduleAutoFill'), 1)) return { ok: true, skipped: true }
+  const horizon = 3
+  const today = ctx.day()
+  const sig = demandSignature(today, horizon)
+  const open = db.prepare("SELECT * FROM dispatch_plans WHERE status='pending' AND source='auto' ORDER BY id DESC LIMIT 1").get()
+  if (open && open.day_from === today && open.demand_signature === sig) return { ok: true, unchanged: true, plan_id: open.id }
+  return createDispatchPlan({ horizon, reason, source: 'auto' })
+}
+
+// 过期清理：跨日推移后，待批计划中全部条目都已过去（day_to < 今日）的自动作废，避免堆积与误批
+export function expireDispatchPlans() {
+  const today = ctx.day()
+  const rows = db.prepare("SELECT id FROM dispatch_plans WHERE status='pending' AND day_to<?").all(today)
+  for (const r of rows) {
+    db.prepare("UPDATE dispatch_plans SET status='expired', handle_tick=?, handle_day=? WHERE id=?").run(ctx.tick(), today, r.id)
+  }
+  return rows.length
+}
+
+// 计划条目审批时二次校验：排班条目（员工在岗/班次有效/未开始或允许补位/无冲突/疲劳规避，含计划内虚拟占用）
+function scheduleItemEligibility(it, occ) {
+  const st = getStaff(it.staff_id)
+  if (!st || !st.active) return { ok: false, code: 'STAFF_OFF', reason: '员工已离岗' }
+  const sh = getShift(it.shift_id)
+  if (!sh) return { ok: false, code: 'SHIFT_NOT_FOUND', reason: '班次已停用' }
+  const day = it.day
+  if (day < ctx.day()) return { ok: false, code: 'DAY_PAST', reason: '日期已过' }
+  const t = ctx.tick()
+  const begin = linear(day, sh.start_hour)
+  const end = sh.cross_day ? linear(day + 1, sh.end_hour) : linear(day, sh.end_hour)
+  if (day === ctx.day() && begin <= t) {
+    if (!it.allow_started) return { ok: false, code: 'SHIFT_STARTED', reason: '班次已开始' }
+    if (t >= end) return { ok: false, code: 'SHIFT_ENDED', reason: '班次已结束' }
+  }
+  if (effectiveScheduleOf(st.id, day)) return { ok: false, code: 'SHIFT_CONFLICT', reason: '该员工当日已有排班' }
+  if (occ.has(`${day}:${st.id}`)) return { ok: false, code: 'PLAN_CONFLICT', reason: '与计划内其他条目冲突' }
+  if (workedNightBefore(st.id, day)) return { ok: false, code: 'FATIGUE', reason: '前夜跨日夜班，疲劳规避' }
+  const prevNight = occ.get(`${day - 1}:${st.id}`)
+  if (prevNight && prevNight.crossDay) return { ok: false, code: 'FATIGUE', reason: '计划内前夜夜班，疲劳规避' }
+  return { ok: true, st, sh }
+}
+
+// 紧急调令条目审批时二次校验：员工当前必须在岗、加班不超闭园限制、无待审批加班、缺口仍存在、班段未结束
+function overtimeItemEligibility(it, occ, vOt) {
+  const st = getStaff(it.staff_id)
+  if (!st || !st.active) return { ok: false, code: 'STAFF_OFF', reason: '员工已离岗' }
+  const t = ctx.tick()
+  if (it.day !== ctx.day()) return { ok: false, code: 'DAY_GONE', reason: '调令日期已非当日' }
+  const sch = it.schedule_id ? db.prepare(`SELECT * FROM staff_schedules WHERE id=? AND ${EFFECTIVE}`).get(it.schedule_id) : null
+  if (!sch) return { ok: false, code: 'SCHED_GONE', reason: '当值排班已不存在' }
+  if (sch.staff_id !== st.id) return { ok: false, code: 'STAFF_MISMATCH', reason: '排班与员工不匹配' }
+  const sh = getShift(sch.shift_id)
+  if (!sh || sh.cross_day) return { ok: false, code: 'SHIFT_BAD', reason: '跨日夜班不发紧急调令' }
+  const att = attendanceBySchedule(sch.id)
+  if (!att || att.status !== 'checked_in') return { ok: false, code: 'NOT_ON_DUTY', reason: '员工当前不在岗' }
+  const curHour = OPEN_HOUR + (t - linear(it.day, OPEN_HOUR))
+  const bandEnd = it.band === 'morning' ? 14 : it.band === 'mid' ? 17 : CLOSE_HOUR
+  if (curHour >= bandEnd) return { ok: false, code: 'BAND_ENDED', reason: '缺口班段已结束' }
+  if (it.ot_ticks < 1 || sh.end_hour + att.overtime_ticks + it.ot_ticks > CLOSE_HOUR) {
+    return { ok: false, code: 'OT_TOO_LONG', reason: '加班超出闭园时段限制' }
+  }
+  const dup = db.prepare("SELECT id FROM shift_requests WHERE kind='overtime' AND status='pending' AND schedule_id=?").get(sch.id)
+  if (dup) return { ok: false, code: 'OT_PENDING', reason: '已有待审批加班申请' }
+  if (vOt.includes(sch.id)) return { ok: false, code: 'OT_PENDING', reason: '计划内已含该员工调令' }
+  const list = virtualRoster(it.day, occ)
+  const gapNow = gapsForDay(it.day, { list }).gaps.find(g => g.band === it.band && g.role === it.role)
+  if (!gapNow || gapNow.gap <= 0) return { ok: false, code: 'GAP_GONE', reason: '缺口已被补齐，调令冗余' }
+  return { ok: true, st, sh, att }
+}
+
+// 主管审批跨日计划：逐条二次校验，在同一事务内原子落地排班/调令，任一写入失败整体回滚；
+// 已失效（班次已过/员工离岗）或冗余（缺口已不存在）的条目安全跳过；提交后联动补齐新生缺口。
+export function approveDispatchPlan(planId, approverId = null, note = '') {
+  let result
+  try {
+    result = tx(() => {
+      const plan = db.prepare('SELECT * FROM dispatch_plans WHERE id=?').get(planId)
+      if (!plan) return fail('NOT_FOUND', '跨日计划不存在')
+      if (plan.status !== 'pending') return fail('PLAN_GONE', `计划已${({ approved: '批准', rejected: '驳回', obsolete: '更新替代', expired: '过期' })[plan.status] || '处理'}`)
+      const items = db.prepare('SELECT * FROM dispatch_plan_items WHERE plan_id=? ORDER BY seq,id').all(planId)
+      const occ = new Map()
+      const vOt = []
+      const appliedSchedules = []
+      const appliedOts = []
+      const skipped = []
+      let seq = 0
+      for (const it of items) {
+        if (it.kind === 'schedule') {
+          const chk = scheduleItemEligibility(it, occ)
+          if (!chk.ok) { skipped.push({ id: it.id, kind: 'schedule', reason: chk.reason, code: chk.code }); continue }
+          seq += 1
+          const rr = createSchedule({
+            staffId: it.staff_id, shiftId: it.shift_id, day: it.day, source: 'dispatch',
+            note: `跨日计划 ${plan.code} 审批落地：${it.note}`,
+            requestId: `plan-${plan.id}-${it.id}`,
+            allowStarted: !!it.allow_started
+          })
+          if (!rr.ok) { skipped.push({ id: it.id, kind: 'schedule', reason: rr.msg || '排班失败', code: rr.code }); continue }
+          occ.set(`${it.day}:${it.staff_id}`, {
+            day: it.day, staffId: it.staff_id, shiftId: it.shift_id,
+            crossDay: chk.sh.cross_day ? 1 : 0, seq
+          })
+          db.prepare("UPDATE dispatch_plan_items SET status='applied', schedule_id=?, note=note||? WHERE id=?")
+            .run(rr.id, `（落地排班 ${rr.code}）`, it.id)
+          appliedSchedules.push({ item_id: it.id, schedule_id: rr.id, code: rr.code, staff_id: it.staff_id, day: it.day })
+        } else {
+          const chk = overtimeItemEligibility(it, occ, vOt)
+          if (!chk.ok) { skipped.push({ id: it.id, kind: 'overtime', reason: chk.reason, code: chk.code }); continue }
+          const ins = insertUrgentOvertime({
+            staffId: it.staff_id, scheduleId: it.schedule_id, day: it.day, ticks: it.ot_ticks,
+            reason: `跨日计划 ${plan.code} 审批：${it.note}`
+          })
+          vOt.push(it.schedule_id)
+          db.prepare("UPDATE dispatch_plan_items SET status='applied', ref_request_id=?, note=note||? WHERE id=?")
+            .run(ins.id, `（调令 ${ins.code}）`, it.id)
+          appliedOts.push({ item_id: it.id, request_id: ins.id, code: ins.code, staff_id: it.staff_id, ticks: it.ot_ticks })
+        }
+      }
+      // 审批时判定失效/冗余的条目统一回写 skipped 并留痕原因（applied 已在上面逐条更新）
+      for (const s of skipped) {
+        db.prepare("UPDATE dispatch_plan_items SET status='skipped', note=note||? WHERE id=? AND status='pending'")
+          .run(`（审批跳过：${s.reason}）`, s.id)
+      }
+      db.prepare(`UPDATE dispatch_plans
+         SET status='approved', approver_id=?, handle_tick=?, handle_day=?, approve_note=?,
+             applied_schedules=?, applied_ots=?, skipped_items=?
+         WHERE id=?`)
+        .run(approverId, ctx.tick(), ctx.day(), String(note).slice(0, 120),
+          appliedSchedules.length, appliedOts.length, skipped.length, plan.id)
+      logShift({
+        action: 'plan_approve', approverId,
+        note: `跨日调度计划 ${plan.code} 批准落地：新增排班 ${appliedSchedules.length} 张、紧急调令 ${appliedOts.length} 条、跳过失效条目 ${skipped.length}；预估工资 ¥${plan.est_wage}`
+      })
+      return {
+        ok: true, code: plan.code, appliedSchedules, appliedOts, skipped,
+        appliedCount: appliedSchedules.length + appliedOts.length
+      }
+    })
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) return fail('SHIFT_CONFLICT', '落地时发生排班冲突，计划已整体回滚未生效')
+    console.error('[scheduling] 跨日计划审批失败，已整体回滚:', e)
+    return fail('TX_FAILED', '系统繁忙，审批未生效，请稍后重试')
+  }
+  // 提交后联动：审批模式下残余缺口转为新的待批计划；直接模式下立即补位（不自动发调令，避免绕过审批）
+  if (result?.ok) {
+    try {
+      if (num(getSetting('scheduleApproval'), 0)) result.newPlan = refreshAutoDispatchPlan('跨日计划审批后残余缺口')
+      else result.dispatch = runDynamicDispatch({ horizon: 3, urgentOvertime: false, reason: '跨日计划审批后缺口补齐' })
+    } catch (e) {
+      console.error('[scheduling] 计划审批后联动补齐失败（不影响审批结果）:', e)
+    }
+  }
+  return result
+}
+
+// 主管驳回跨日计划（计划与条目保留留痕，不产生任何排班/调令）
+export function rejectDispatchPlan(planId, approverId = null, note = '') {
+  return tx(() => {
+    const plan = db.prepare('SELECT * FROM dispatch_plans WHERE id=?').get(planId)
+    if (!plan) return fail('NOT_FOUND', '跨日计划不存在')
+    if (plan.status !== 'pending') return fail('PLAN_GONE', '计划已处理，不能重复驳回')
+    db.prepare("UPDATE dispatch_plans SET status='rejected', approver_id=?, handle_tick=?, handle_day=?, approve_note=? WHERE id=?")
+      .run(approverId, ctx.tick(), ctx.day(), String(note).slice(0, 120), plan.id)
+    db.prepare("UPDATE dispatch_plan_items SET status='skipped' WHERE plan_id=? AND status='pending'").run(plan.id)
+    logShift({ action: 'plan_reject', approverId, note: `跨日调度计划 ${plan.code} 驳回：${note || '主管不采纳该补位方案'}` })
+    return { ok: true, code: plan.code }
+  })
+}
+
+// ---------------- 跨日计划查询（条目富化 + 新鲜度/二次校验 + 落地后残余缺口） ----------------
+function enrichPlanItem(it) {
+  const st = getStaff(it.staff_id)
+  const sh = db.prepare('SELECT * FROM shift_templates WHERE id=?').get(it.shift_id)
+  let reasonObj = null
+  try { reasonObj = JSON.parse(it.reason_snapshot || '{}') } catch { reasonObj = null }
+  return {
+    ...it,
+    staff_name: st?.name || '',
+    staff_role: st?.role || '',
+    staff_active: st ? !!st.active : false,
+    shift_name: sh?.name || '',
+    shift_color: sh?.color || '#66a6ff',
+    hourly_wage: hourlyWage(st?.wage ?? 300),
+    reason_obj: reasonObj
+  }
+}
+
+// 待批计划读取时实时复核：返回每条目当前是否可落地（applicable/invalid/redundant + 原因）与落地后残余缺口
+function planReplay(plan, items) {
+  if (plan.status !== 'pending') {
+    return {
+      stale: false,
+      items: items.map(it => ({ ...it, check: { state: it.status === 'applied' ? 'applied' : 'skipped' } })),
+      residual: []
+    }
+  }
+  const occ = new Map()
+  const vOt = []
+  let seq = 0
+  const checked = []
+  for (const it of items) {
+    if (it.status !== 'pending') { checked.push({ ...it, check: { state: 'skipped', reason: '条目已非待批' } }); continue }
+    if (it.kind === 'schedule') {
+      const chk = scheduleItemEligibility(it, occ)
+      if (chk.ok) {
+        seq += 1
+        occ.set(`${it.day}:${it.staff_id}`, { day: it.day, staffId: it.staff_id, shiftId: it.shift_id, crossDay: chk.sh.cross_day ? 1 : 0, seq })
+        checked.push({ ...it, check: { state: 'applicable' } })
+      } else checked.push({ ...it, check: { state: 'invalid', code: chk.code, reason: chk.reason } })
+    } else {
+      const chk = overtimeItemEligibility(it, occ, vOt)
+      if (chk.ok) { vOt.push(it.schedule_id); checked.push({ ...it, check: { state: 'applicable' } }) }
+      else checked.push({ ...it, check: { state: chk.code === 'GAP_GONE' ? 'redundant' : 'invalid', code: chk.code, reason: chk.reason } })
+    }
+  }
+  // 计划全部可落地条目叠加后的残余缺口（与需求画像当前口径对比）
+  const residual = []
+  for (let d = plan.day_from; d <= plan.day_to; d++) {
+    const list = virtualRoster(d, occ)
+    const cov = coverageForDay(d, { list })
+    residual.push({
+      day: d, rosterCount: cov.rosterCount,
+      warnings: cov.warnings.length, blocks: cov.warnings.filter(w => w.level === 'block').length,
+      hard: cov.warnings.filter(w => w.level === 'block').map(w => ({ msg: w.msg, type: w.type, band: w.band || null }))
+    })
+  }
+  const stale = plan.demand_signature !== demandSignature(plan.day_from, plan.horizon)
+  return { stale, items: checked, residual }
+}
+
+function enrichPlan(plan, { replay = true } = {}) {
+  const rawItems = db.prepare('SELECT * FROM dispatch_plan_items WHERE plan_id=? ORDER BY seq,id').all(plan.id)
+  let items = rawItems.map(enrichPlanItem)
+  let days = null
+  try { days = JSON.parse(plan.demand_snapshot || '{}').days || null } catch { days = null }
+  const out = {
+    ...plan,
+    days,
+    items: replay ? [] : items,
+    applicableCount: 0, invalidCount: 0, redundantCount: 0,
+    stale: false, residual: []
+  }
+  if (!replay) return out
+  const r = planReplay(plan, items)
+  out.stale = r.stale
+  out.items = r.items
+  out.residual = r.residual
+  out.applicableCount = r.items.filter(x => x.check?.state === 'applicable').length
+  out.invalidCount = r.items.filter(x => x.check?.state === 'invalid').length
+  out.redundantCount = r.items.filter(x => x.check?.state === 'redundant').length
+  out.residualWarnings = r.residual.reduce((s, x) => s + x.warnings, 0)
+  out.residualBlocks = r.residual.reduce((s, x) => s + x.blocks, 0)
+  return out
+}
+
+export function getDispatchPlan(id) {
+  const plan = db.prepare('SELECT * FROM dispatch_plans WHERE id=?').get(id)
+  return plan ? enrichPlan(plan) : null
+}
+
+export function listDispatchPlans({ status = null, source = null, limit = 30 } = {}) {
+  const where = []
+  const args = []
+  if (status && status !== 'all') { where.push('status=?'); args.push(status) }
+  if (source) { where.push('source=?'); args.push(source) }
+  const rows = db.prepare(`SELECT * FROM dispatch_plans ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`)
+    .all(...args, limit)
+  // 列表不复刻逐条二次校验（成本高），只标记需求新鲜度；详情接口才做逐条复核
+  return rows.map(p => {
+    const stale = p.status === 'pending' && p.demand_signature !== demandSignature(p.day_from, p.horizon)
+    return { ...p, stale }
+  })
 }
 
 // ---------------- 引擎：自动补位 / 打卡 / 工时累计 / 下班结算 ----------------
@@ -958,6 +1483,12 @@ function autoFillSchedules() {
   if (!num(getSetting('scheduleAutoFill'), 1)) return
   if (!db.prepare('SELECT COUNT(*) n FROM shift_templates WHERE active=1').get().n) return
   if (getSetting('scheduleMode', 'dynamic') === 'dynamic') {
+    if (num(getSetting('scheduleApproval'), 0)) {
+      // 审批模式：引擎不直接补位，改为生成/刷新跨日待批计划，由运营主管预览审批后原子落地
+      expireDispatchPlans()
+      refreshAutoDispatchPlan('引擎每小时需求巡检')
+      return
+    }
     // 动态模式：按预约客流 / 检修工单 / 投诉岗位需求补缺口（含当天紧急加班调令）
     runDynamicDispatch({ horizon: 3, urgentOvertime: true, reason: '引擎每小时需求巡检' })
     return
@@ -1186,6 +1717,8 @@ export function schedulingStats() {
   const pending = db.prepare("SELECT COUNT(*) n FROM shift_requests WHERE status='pending'").get().n
   const dispatchOt = db.prepare("SELECT COUNT(*) n FROM shift_requests WHERE status='pending' AND source='dispatch'").get().n
   const dispatchToday = db.prepare(`SELECT COUNT(*) n FROM staff_schedules WHERE create_day=? AND source='dispatch'`).get(day).n
+  const pendingPlans = db.prepare("SELECT COUNT(*) n, COALESCE(SUM(est_wage),0) w FROM dispatch_plans WHERE status='pending'").get()
+  const pendingAutoPlan = db.prepare("SELECT id,code FROM dispatch_plans WHERE status='pending' AND source='auto' ORDER BY id DESC LIMIT 1").get()
   // 跨日夜班：前一日 17 点上班、当前仍在岗（次日凌晨值守）的人数（次日 9:00 即自动结算）
   const nightOn = db.prepare(`SELECT COUNT(*) n FROM staff_attendance a
     JOIN shift_templates sh ON sh.id=a.shift_id
@@ -1203,6 +1736,11 @@ export function schedulingStats() {
     pendingRequests: pending,
     dispatchOtRequests: dispatchOt,
     dispatchFilledToday: dispatchToday,
+    pendingPlanCount: pendingPlans.n,
+    pendingPlanWage: pendingPlans.w,
+    pendingAutoPlanId: pendingAutoPlan?.id || null,
+    pendingAutoPlanCode: pendingAutoPlan?.code || '',
+    approvalMode: num(getSetting('scheduleApproval'), 0) ? 1 : 0,
     nightOnDuty: nightOn,
     flowToday: coverage.demand.flowTotal,
     coverageWarnings: coverage.warnings.length,
@@ -1218,10 +1756,17 @@ export function dispatchPlan({ horizon = 3 } = {}) {
     const cov = coverageForDay(d)
     days.push({ day: d, demand: cov.demand, warnings: cov.warnings, rosterCount: cov.rosterCount })
   }
+  const pending = db.prepare("SELECT COUNT(*) n, COALESCE(SUM(est_wage),0) w, COALESCE(SUM(item_count),0) items FROM dispatch_plans WHERE status='pending'").get()
+  const autoPlan = db.prepare("SELECT id FROM dispatch_plans WHERE status='pending' AND source='auto' ORDER BY id DESC LIMIT 1").get()
   return {
     today,
     mode: getSetting('scheduleMode', 'dynamic'),
     autoFill: num(getSetting('scheduleAutoFill'), 1) ? 1 : 0,
+    approvalMode: num(getSetting('scheduleApproval'), 0) ? 1 : 0,
+    pendingPlans: pending.n,
+    pendingPlanWage: pending.w,
+    pendingPlanItems: pending.items,
+    pendingAutoPlanId: autoPlan?.id || null,
     params: {
       guardFlow: num(getSetting('dispatchGuardFlow'), 500),
       cleanFlow: num(getSetting('dispatchCleanFlow'), 700),

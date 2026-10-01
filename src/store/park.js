@@ -43,7 +43,8 @@ function emptySchedulingStats() {
     day: 1, todayScheduled: 0, onDuty: 0, absentToday: 0, lateToday: 0,
     overtimeHoursToday: 0, settledToday: 0, payToday: 0, pendingRequests: 0,
     coverageWarnings: 0, coverageBlocks: 0,
-    dispatchOtRequests: 0, dispatchFilledToday: 0, nightOnDuty: 0, flowToday: 0
+    dispatchOtRequests: 0, dispatchFilledToday: 0, nightOnDuty: 0, flowToday: 0,
+    pendingPlanCount: 0, pendingPlanWage: 0, pendingAutoPlanId: null, pendingAutoPlanCode: '', approvalMode: 0
   }
 }
 
@@ -99,6 +100,7 @@ export const useParkStore = defineStore('park', {
     schedulingStats: s => s.data?.schedulingStats || emptySchedulingStats(),
     coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0 },
     dispatchPlanData: s => s.data?.dispatchPlan || { days: [], params: {}, mode: 'dynamic' },
+    dispatchPlans: s => s.data?.dispatchPlans || [],
     supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管'),
     // 领队组团
     groups: s => s.data?.groups || [],
@@ -180,6 +182,12 @@ export const useParkStore = defineStore('park', {
     runDispatch(payload) { return this.api('POST', '/dispatch/run', payload || {}) },
     async coverageOf(day) { return j('GET', `/coverage/${day}`) },
     async dispatchPlanFetch() { return j('GET', '/dispatch-plan') },
+    // 跨日计划预览与审批
+    createDispatchPlan(payload) { return this.api('POST', '/dispatch-plans', payload) },
+    async dispatchPlansList(status) { return j('GET', `/dispatch-plans?status=${status || 'pending'}`) },
+    async dispatchPlanDetail(id) { return j('GET', `/dispatch-plans/${id}`) },
+    approveDispatchPlan(id, approver_id, note) { return this.api('POST', `/dispatch-plans/${id}/approve`, { approver_id, note }) },
+    rejectDispatchPlan(id, approver_id, note) { return this.api('POST', `/dispatch-plans/${id}/reject`, { approver_id, note }) },
     async scheduleLogs(payload) {
       const q = new URLSearchParams(Object.entries(payload).filter(([, v]) => v != null && v !== '').map(([k, v]) => [k, v])).toString()
       return j('GET', `/schedules/logs?${q}`)

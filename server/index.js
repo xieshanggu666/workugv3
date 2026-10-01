@@ -28,7 +28,9 @@ import {
   requestOvertime, approveOvertime, rejectOvertime, cancelRequest,
   listSchedules, listAttendance, listRequests as listShiftRequests,
   shiftLogs, schedulingStats, coverageForDay, staffDutyState, writeWorkCompletion,
-  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter
+  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter,
+  createDispatchPlan, approveDispatchPlan, rejectDispatchPlan, getDispatchPlan, listDispatchPlans,
+  refreshAutoDispatchPlan, expireDispatchPlans
 } from './scheduling.js'
 import {
   initGroupContext, submitGroup, confirmGroup, rejectGroup, cancelGroup,
@@ -931,6 +933,7 @@ app.get('/api/state', (req, res) => {
     schedulingStats: schedulingStats(),
     coverageToday: coverageForDay(state.day()),
     dispatchPlan: dispatchPlan({ horizon: 3 }),
+    dispatchPlans: listDispatchPlans({ limit: 20 }),
     // 统一客流预测与资源调度闭环（统一预测 + 缺口画像 + 一致性巡检）
     closedLoop: closedLoopOverview({ horizon: 3, demandProvider: d => demandForDay(d) }),
     reconcileList: listFindings({ status: 'open', limit: 50 }),
@@ -1460,6 +1463,7 @@ app.post('/api/schedule-config', (req, res) => {
   const b = req.body || {}
   if (b.auto_fill !== undefined) setSetting('scheduleAutoFill', b.auto_fill ? 1 : 0)
   if (b.mode !== undefined) setSetting('scheduleMode', b.mode === 'auto' ? 'auto' : 'dynamic')
+  if (b.approval_mode !== undefined) setSetting('scheduleApproval', b.approval_mode ? 1 : 0)
   if (b.ot_rate_mul !== undefined) {
     const v = Math.max(1, Math.min(3, num(b.ot_rate_mul, 1.5)))
     setSetting('otRateMul', v)
@@ -1470,6 +1474,7 @@ app.post('/api/schedule-config', (req, res) => {
   res.json({ ok: true, config: {
     autoFill: num(getSetting('scheduleAutoFill'), 1) ? 1 : 0,
     mode: getSetting('scheduleMode', 'dynamic'),
+    approvalMode: num(getSetting('scheduleApproval'), 0) ? 1 : 0,
     otRateMul: num(getSetting('otRateMul'), 1.5),
     guardFlow: num(getSetting('dispatchGuardFlow'), 500),
     cleanFlow: num(getSetting('dispatchCleanFlow'), 700),
@@ -1482,9 +1487,62 @@ app.get('/api/dispatch-plan', (req, res) => {
   res.json({ plan: dispatchPlan({ horizon: 3 }) })
 })
 
+// ---- 跨日计划预览与审批 ----
+// 跨日计划列表（默认待审批；?status=all 查看全部）
+app.get('/api/dispatch-plans', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listDispatchPlans({ status: q.status && q.status !== 'all' ? q.status : null, limit: 60 }),
+    approvalMode: num(getSetting('scheduleApproval'), 0) ? 1 : 0
+  })
+})
+
+// 跨日计划详情：逐条二次校验（可落地/已失效/冗余）+ 落地后岗位覆盖残余缺口 + 需求新鲜度
+app.get('/api/dispatch-plans/:id', (req, res) => {
+  const plan = getDispatchPlan(num(req.params.id))
+  if (!plan) return res.status(404).json({ ok: false, msg: '跨日计划不存在' })
+  res.json({ plan })
+})
+
+// 生成跨日计划预览（dry-run）：联动预约客流/检修工单/投诉优先级，只落计划单不写排班
+app.post('/api/dispatch-plans', (req, res) => {
+  const b = req.body || {}
+  const r = createDispatchPlan({
+    horizon: num(b.horizon, 3),
+    reason: String(b.reason || '主管生成跨日调度预览'),
+    source: 'manual',
+    requestId: idemKey(req)
+  })
+  reply(req, res, r)
+})
+
+// 主管审批跨日计划：原子落地全部仍可落地条目；失效/冗余条目安全跳过
+app.post('/api/dispatch-plans/:id/approve', (req, res) => {
+  const b = req.body || {}
+  const r = approveDispatchPlan(num(req.params.id), num(b.approver_id) || null, String(b.note || ''))
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId, plan: getDispatchPlan(num(req.params.id)) })
+})
+
+// 主管驳回跨日计划
+app.post('/api/dispatch-plans/:id/reject', (req, res) => {
+  const b = req.body || {}
+  const r = rejectDispatchPlan(num(req.params.id), num(b.approver_id) || null, String(b.note || ''))
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
 // 手动触发一次动态补位：按需求缺口自动排班；当天已开始班段的缺口转紧急加班调令（走主管审批）
+// 审批模式下不直接补位，而是生成一份跨日待批计划预览（返回 plan_id 供前端跳转审批）
 app.post('/api/dispatch/run', (req, res) => {
   const b = req.body || {}
+  if (num(getSetting('scheduleApproval'), 0)) {
+    const r = createDispatchPlan({
+      horizon: 3,
+      reason: String(b.reason || '主管手动生成跨日计划'),
+      source: 'manual',
+      requestId: idemKey(req)
+    })
+    return res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId, approvalMode: 1, plan: dispatchPlan({ horizon: 3 }) })
+  }
   const r = runDynamicDispatch({
     horizon: 3,
     urgentOvertime: b.urgent_overtime !== false,
